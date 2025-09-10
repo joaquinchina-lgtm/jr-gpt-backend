@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JR · Caja de texto discreta</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 40px; }
+    .wrap { max-width: 720px; margin: auto; }
+    h1 { font-size: 1.1rem; font-weight: 600; opacity: .8; }
+    form { position: relative; margin: 18px 0; }
+    input[type="text"] { width:100%; padding: .9rem 1.2rem; border: 1px solid #d0d0d0; border-radius: 999px; outline: none; }
+    input[type="text"]:focus { border-color: #999; }
+    .bubble-u { background: #eef3ff; padding: .7rem .9rem; border-radius: 14px; margin: .3rem 0; }
+    .bubble-a { background: #f6f6f6; padding: .7rem .9rem; border-radius: 14px; margin: .3rem 0; white-space: pre-wrap;}
+    small { color: #555; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Asistente JR (caja discreta)</h1>
+    <form id="jr-chat">
+      <input id="msg" type="text" placeholder="Escribe y pulsa Enter">
+    </form>
+    <div id="log"></div>
+    <small>Consejo: configura <code>JR_API_KEY</code> para proteger tu endpoint.</small>
+  </div>
+  <script>
+    const form = document.getElementById('jr-chat');
+    const log = document.getElementById('log');
+    form.addEventListener('submit', async (e)=>{
+      e.preventDefault();
+      const message = document.getElementById('msg').value.trim();
+      if(!message) return;
+      document.getElementById('msg').value = '';
+      const u = document.createElement('div'); u.className='bubble-u'; u.textContent = message; log.appendChild(u);
+      try{
+        const r = await fetch('/chat', {
+          method: 'POST',
+          headers: {
+            'Content-Type':'application/json',
+            'Authorization':'Bearer ' + (window.JR_API_KEY || 'cambia-esta-clave')
+          },
+          body: JSON.stringify({ message, session_id: 'web-1', user_id: 'jr' })
+        });
+        const data = await r.json();
+        const a = document.createElement('div'); a.className='bubble-a'; a.textContent = data.reply; log.appendChild(a);
+        window.scrollTo(0, document.body.scrollHeight);
+      }catch(err){
+        const a = document.createElement('div'); a.className='bubble-a'; a.textContent = 'Error: ' + err; log.appendChild(a);
+      }
+    });
+  </script>
+</body>
+</html>
