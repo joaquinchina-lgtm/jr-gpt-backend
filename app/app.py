@@ -19,6 +19,15 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 app = FastAPI(title="JR GPT Backend", version="0.1.0")
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://joaquinchina-lgtm.github.io"],
+    allow_credentials=False,
+    allow_methods=["POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 
 class ChatInput(BaseModel):
     message: str
