@@ -28,7 +28,11 @@ app.add_middleware(
     allow_methods=["POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
-
+@app.post("/chat")
+async def chat(request: Request):
+    data = await request.json()
+    message = data.get("message", "")
+    return {"reply": f"Recibí: {message}"}
 class ChatInput(BaseModel):
     message: str
     session_id: str
