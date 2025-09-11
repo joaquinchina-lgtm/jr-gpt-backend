@@ -1,183 +1,121 @@
-# --- imports
-import os, json, time
-from typing import Dict, Any, List, Optional
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi import Security
+# app/app.py
+import os, json
+import numpy as np
+import faiss
 
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Request
-from pydantic import BaseModel
-from dotenv import load_dotenv
-
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 
-from .rag import search_docs
-
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Falta OPENAI_API_KEY. Crea un archivo .env (copia .env.example)")
-
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 app = FastAPI(title="JR GPT Backend", version="0.1.0")
-from fastapi.middleware.cors import CORSMiddleware
 
-# CORS
+# --- CORS (ajusta tu dominio si cambias GitHub Pages) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://joaquinchina-lgtm.github.io"],
     allow_credentials=False,
-    allow_methods=["POST", "OPTIONS"],
+    allow_methods=["POST", "OPTIONS", "GET"],
     allow_headers=["Content-Type", "Authorization"],
 )
+
+# --- OpenAI ---
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+EMBED_MODEL = "text-embedding-3-small"
+GEN_MODEL = "gpt-4o-mini"
+
+# --- RAG config ---
+RAG_DIR = os.getenv("RAG_DIR", "rag")
+INDEX_PATH = os.path.join(RAG_DIR, "index.faiss")
+TEXTS_PATH = os.path.join(RAG_DIR, "texts.json")
+RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.15"))   # umbral similitud
+CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "9000"))
+
+index = None
+records = None
+
+def embed(text: str) -> np.ndarray:
+    e = client.embeddings.create(model=EMBED_MODEL, input=[text])
+    v = np.array(e.data[0].embedding, dtype="float32")
+    v = v / (np.linalg.norm(v) + 1e-10)
+    return v
+
+@app.on_event("startup")
+def load_rag():
+    global index, records
+    if not (os.path.exists(INDEX_PATH) and os.path.exists(TEXTS_PATH)):
+        print("[RAG] No encuentro el índice. Genera primero rag/index.faiss y rag/texts.json")
+        return
+    index = faiss.read_index(INDEX_PATH)
+    with open(TEXTS_PATH, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    print(f"[RAG] Cargado índice y {len(records)} chunks.")
+
+def retrieve(query: str, k: int = 5):
+    if index is None or records is None:
+        return []
+    q = embed(query)
+    D, I = index.search(np.array([q]), k)
+    out = []
+    for score, idx in zip(D[0], I[0]):
+        if idx == -1: continue
+        out.append({"score": float(score), **records[idx]})
+    return out
+
+@app.get("/health")
+def health(): return {"ok": True}
+
+@app.get("/status")
+def status():
+    return {
+        "index_loaded": bool(index is not None),
+        "num_chunks": (len(records) if records else 0),
+        "min_score": RAG_MIN_SCORE
+    }
+
 @app.post("/chat")
 async def chat(request: Request):
     data = await request.json()
-    msg = data.get("message", "")
+    query = (data.get("message") or "").strip()
+    top_k = int(data.get("top_k", 5))
 
-# llamada a OpenAI GPT
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",   # rápido y barato; puedes cambiar
-        messages=[
-            {"role": "system", "content": "Eres un asistente experto en innovación y transferencia."},
-            {"role": "user", "content": msg},
-        ],
+    if not query:
+        return {"reply": "Escribe una pregunta."}
+
+    # 1) Recuperar contexto
+    hits = retrieve(query, k=top_k)
+    if not hits:
+        return {"reply": "No consta en nuestras fuentes internas."}
+
+    # 2) Filtrar por umbral
+    hits = [h for h in hits if h["score"] >= RAG_MIN_SCORE]
+    if not hits:
+        return {"reply": "No hay coincidencias suficientemente relevantes en las fuentes internas."}
+
+    # 3) Construir contexto limitado
+    context_blocks, total = [], 0
+    for i, h in enumerate(hits, 1):
+        block = f"[{i}] Fuente: {h['source']}\n{h['text']}\n"
+        if total + len(block) > CONTEXT_MAX_CHARS: break
+        context_blocks.append(block)
+        total += len(block)
+    context = "\n".join(context_blocks)
+
+    # 4) Preguntar al modelo con guardarraíles
+    system_prompt = (
+        "Eres el asistente de JR. Responde ÚNICAMENTE con la información de los extractos. "
+        "Si la respuesta no está en los extractos, di: «No consta en nuestras fuentes internas.» "
+        "Cuando cites algo, referencia [1], [2]… según el extracto. No inventes nombres ni contactos."
     )
+    user_msg = f"Extractos:\n{context}\n\nPregunta: {query}"
+
+    completion = client.chat.completions.create(
+        model=GEN_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",    "content": user_msg},
+        ],
+        temperature=0.0,
+    )
+
     reply = completion.choices[0].message.content
     return {"reply": reply}
-    
-class ChatInput(BaseModel):
-    message: str
-    session_id: str
-    user_id: Optional[str] = None
-
-class ChatOutput(BaseModel):
-    reply: str
-    tool_calls: Optional[List[Dict[str, Any]]] = None
-    latency_ms: int
-
-security = HTTPBearer(auto_error=False)
-JR_API_KEY = os.getenv("JR_API_KEY")
-
-# ===== Auth: SOLO para rutas privadas =====
-def verify_jr_key(creds: HTTPAuthorizationCredentials = Depends(security)):
-    if not JR_API_KEY:
-        # Si no hay clave en el servidor, no exigimos auth (opcional)
-        return
-    if not creds or creds.scheme.lower() != "bearer" or creds.credentials != JR_API_KEY:
-        raise HTTPException(status_code=401, detail="Falta cabecera Authorization: Bearer <JR_API_KEY>")
-
-# Routers
-public = APIRouter()                          # ← sin auth
-private = APIRouter(dependencies=[Depends(verify_jr_key)])  # ← con auth
-
-# ===== Ruta pública: /chat (SIN Authorization) =====
-@public.post("/chat")
-async def chat(request: Request):
-    data = await request.json()
-    msg = data.get("message", "")
-    # TODO: tu llamada a OpenAI aquí; de momento eco:
-    return {"reply": f"Recibí: {msg}"}
-
-# ===== Ejemplo de ruta privada (con Authorization obligatorio) =====
-@private.get("/status")
-def status():
-    return {"ok": True}
-
-# Montaje de routers
-app.include_router(public)     # /chat libre
-app.include_router(private)    # resto protegido
-
-def require_auth(credentials: HTTPAuthorizationCredentials = Security(security)):
-    expected = os.getenv("JR_API_KEY")
-    if expected:
-        if not credentials or credentials.scheme.lower() != "bearer":
-            raise HTTPException(401, "Falta cabecera Authorization: Bearer <JR_API_KEY>")
-        if credentials.credentials != expected:
-            raise HTTPException(401, "API key incorrecta")
-    return True
-
-SESSIONS: Dict[str, List[Dict[str, str]]] = {}
-
-SYSTEM_PROMPT = (
-    "Eres un asistente para una web de innovación y educación en Navarra. "
-    "Objetivo: ayudar con dudas técnicas, RAG sobre documentos cargados y dar respuestas claras. "
-    "Si te piden fuentes, cita resultados de 'search_docs'. "
-)
-
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_docs",
-            "description": "Busca pasajes relevantes en el corpus interno",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"]
-            }
-        }
-    }
-]
-
-def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
-    if name == "search_docs":
-        q = arguments.get("query","")
-        return search_docs(q, k=5)
-    return {"error":"Tool not found"}
-
-@app.get("/health")
-def health():
-    return {"status":"ok"}
-
-@app.post("/chat", response_model=ChatOutput)
-def chat(body: ChatInput, _: bool = Depends(require_auth)):
-    start = time.time()
-
-    short_memory = ""
-    if SESSIONS.get(body.session_id):
-        last = SESSIONS[body.session_id][-3:]
-        for turn in last:
-            short_memory += f"User: {turn['user']}\\nAssistant: {turn['assistant']}\\n"
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT + f" Memoria breve:\\n{short_memory}"},
-        {"role": "user", "content": body.message},
-    ]
-
-    resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=messages,
-        tools=tools,
-        tool_choice="auto",
-        temperature=0.3
-    )
-
-    tool_calls = resp.choices[0].message.tool_calls or []
-    tool_results = []
-
-    if tool_calls:
-        messages.append(resp.choices[0].message)
-        for tc in tool_calls:
-            args = json.loads(tc.function.arguments or "{}")
-            result = call_tool(tc.function.name, args)
-            tool_results.append({"id": tc.id, "name": tc.function.name, "result": result})
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "name": tc.function.name,
-                "content": json.dumps(result, ensure_ascii=False)
-            })
-
-        resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=messages,
-            temperature=0.3
-        )
-
-    answer = resp.choices[0].message.content
-
-    SESSIONS.setdefault(body.session_id, []).append({"user": body.message, "assistant": answer})
-    latency_ms = int((time.time() - start) * 1000)
-
-    return ChatOutput(reply=answer, tool_calls=tool_results or None, latency_ms=latency_ms)
