@@ -10,6 +10,9 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 
+from pydantic import BaseModel
+from typing import Optional
+
 # =========================
 # Configuración y constantes
 # =========================
@@ -166,19 +169,23 @@ def status():
         "models": {"embed": EMBED_MODEL, "gen": GEN_MODEL},
     }
 
+class ChatRequest(BaseModel):
+    message: str
+    mode: Optional[str] = "estricto"
+    top_k: Optional[int] = 5
+
+
 # =========================
 # /chat (principal)
 # =========================
 @app.post("/chat")
 async def chat(request: Request):
-    """
-    Body esperado:
-    {
-      "message": "tu pregunta",
-      "mode": "estricto" | "contextual",   # opcional (por defecto "estricto")
-      "top_k": 5                            # opcional
-    }
-    """
+@app.post("/chat")
+async def chat(body: ChatRequest):
+    query = (body.message or "").strip()
+    mode = (body.mode or "estricto").lower().strip()
+    top_k = int(body.top_k or 5)
+
     try:
         data = await request.json()
     except Exception:
