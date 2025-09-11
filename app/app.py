@@ -17,7 +17,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("Falta OPENAI_API_KEY. Crea un archivo .env (copia .env.example)")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI(title="JR GPT Backend", version="0.1.0")
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,8 +33,19 @@ app.add_middleware(
 @app.post("/chat")
 async def chat(request: Request):
     data = await request.json()
-    message = data.get("message", "")
-    return {"reply": f"Recibí: {message}"}
+    msg = data.get("message", "")
+
+# llamada a OpenAI GPT
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",   # rápido y barato; puedes cambiar
+        messages=[
+            {"role": "system", "content": "Eres un asistente experto en innovación y transferencia."},
+            {"role": "user", "content": msg},
+        ],
+    )
+    reply = completion.choices[0].message.content
+    return {"reply": reply}
+    
 class ChatInput(BaseModel):
     message: str
     session_id: str
