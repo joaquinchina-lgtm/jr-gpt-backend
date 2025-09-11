@@ -1,9 +1,10 @@
+# --- imports
 import os, json, time
 from typing import Dict, Any, List, Optional
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security
 
-from fastapi import FastAPI, Depends, Header, HTTPException
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Request
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -21,6 +22,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI(title="JR GPT Backend", version="0.1.0")
 from fastapi.middleware.cors import CORSMiddleware
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://joaquinchina-lgtm.github.io"],
@@ -44,6 +46,36 @@ class ChatOutput(BaseModel):
     latency_ms: int
 
 security = HTTPBearer(auto_error=False)
+JR_API_KEY = os.getenv("JR_API_KEY")
+
+# ===== Auth: SOLO para rutas privadas =====
+def verify_jr_key(creds: HTTPAuthorizationCredentials = Depends(security)):
+    if not JR_API_KEY:
+        # Si no hay clave en el servidor, no exigimos auth (opcional)
+        return
+    if not creds or creds.scheme.lower() != "bearer" or creds.credentials != JR_API_KEY:
+        raise HTTPException(status_code=401, detail="Falta cabecera Authorization: Bearer <JR_API_KEY>")
+
+# Routers
+public = APIRouter()                          # ← sin auth
+private = APIRouter(dependencies=[Depends(verify_jr_key)])  # ← con auth
+
+# ===== Ruta pública: /chat (SIN Authorization) =====
+@public.post("/chat")
+async def chat(request: Request):
+    data = await request.json()
+    msg = data.get("message", "")
+    # TODO: tu llamada a OpenAI aquí; de momento eco:
+    return {"reply": f"Recibí: {msg}"}
+
+# ===== Ejemplo de ruta privada (con Authorization obligatorio) =====
+@private.get("/status")
+def status():
+    return {"ok": True}
+
+# Montaje de routers
+app.include_router(public)     # /chat libre
+app.include_router(private)    # resto protegido
 
 def require_auth(credentials: HTTPAuthorizationCredentials = Security(security)):
     expected = os.getenv("JR_API_KEY")
