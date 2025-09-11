@@ -1,37 +1,31 @@
-# app/app.py
 import os
 import json
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 import faiss
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from openai import OpenAI
 
-from pydantic import BaseModel
-from typing import Optional
-
 # =========================
-# Configuración y constantes
+# Configuración
 # =========================
 APP_TITLE = "JR GPT Backend"
 APP_VERSION = "0.1.0"
 
-# CORS: por defecto tu GitHub Pages. Puedes sobreescribir con env ORIGIN="*"
 ORIGIN = os.getenv("ORIGIN", "https://joaquinchina-lgtm.github.io")
 
-# Modelos OpenAI
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 GEN_MODEL = os.getenv("GEN_MODEL", "gpt-4o-mini")
 
-# RAG
 RAG_DIR = os.getenv("RAG_DIR", "rag")
 INDEX_PATH = os.path.join(RAG_DIR, "index.faiss")
 TEXTS_PATH = os.path.join(RAG_DIR, "texts.json")
-RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.15"))      # umbral similitud coseno
-CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "9000"))  # límite de contexto a enviar al LLM
+RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.15"))
+CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "9000"))
 
 # =========================
 # App y middlewares
@@ -54,8 +48,8 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 # =========================
 # Carga de índice y textos
 # =========================
-index = None          # tipo: faiss.Index
-records: List[Dict[str, Any]] = None  # lista de {source, text}
+index = None
+records: List[Dict[str, Any]] = None
 
 def _log(msg: str):
     print(f"[RAG] {msg}", flush=True)
@@ -88,7 +82,6 @@ def load_rag():
         records = []
 
 def retrieve(query: str, k: int = 5) -> List[Dict[str, Any]]:
-    """Búsqueda vectorial (coseno vía inner product con vectores normalizados)."""
     if index is None or not records:
         return []
     q = embed(query)
@@ -122,7 +115,6 @@ def extract_entities(hits: List[Dict[str, Any]]):
     return list(names)[:12], list(emails)[:12], list(depts)[:12]
 
 def keyword_hits(terms: List[str], limit: int = 12) -> List[Dict[str, Any]]:
-    """Segundo salto muy simple sobre los chunks: incluye los que contengan los términos."""
     results: List[Dict[str, Any]] = []
     if not records:
         return results
@@ -169,53 +161,41 @@ def status():
         "models": {"embed": EMBED_MODEL, "gen": GEN_MODEL},
     }
 
+# =========================
+# /chat (principal)
+# =========================
 class ChatRequest(BaseModel):
     message: str
     mode: Optional[str] = "estricto"
     top_k: Optional[int] = 5
 
-
-# =========================
-# /chat (principal)
-# =========================
-@app.post("/chat")
-async def chat(request: Request):
 @app.post("/chat")
 async def chat(body: ChatRequest):
     query = (body.message or "").strip()
-    mode = (body.mode or "estricto").lower().strip()
-    top_k = int(body.top_k or 5)
-
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
-
-    query = (data.get("message") or "").strip()
     if not query:
         return {"reply": "Escribe una pregunta."}
 
-    mode = (data.get("mode") or "estricto").lower().strip()
+    mode = (body.mode or "estricto").lower().strip()
+    top_k = int(body.top_k or 5)
 
-    # Parámetros por modo
+    # Configuración por modo
     if mode == "contextual":
-        top_k = int(data.get("top_k", 10))
+        top_k = max(top_k, 10)
         min_score = float(os.getenv("RAG_MIN_SCORE_CTX", "0.12"))
         temperature = 0.2
         enable_second_hop = True
     else:
-        top_k = int(data.get("top_k", 5))
         min_score = RAG_MIN_SCORE
         temperature = 0.0
         enable_second_hop = False
 
-    # 1) Recuperación inicial
+    # Recuperación inicial
     hits = retrieve(query, k=top_k)
     hits = [h for h in hits if h["score"] >= min_score]
     if not hits:
         return {"reply": "No consta en nuestras fuentes internas."}
 
-    # 2) Segundo salto por entidades (para recoger contacto/organigrama)
+    # Segundo salto opcional
     all_hits = hits
     if enable_second_hop:
         names, emails, _depts = extract_entities(hits)
@@ -224,7 +204,7 @@ async def chat(body: ChatRequest):
         extra += keyword_hits(emails, limit=12)
         all_hits = dedup_hits(hits + extra)
 
-    # 3) Construcción del contexto acotado
+    # Construcción de contexto
     context_blocks: List[str] = []
     total = 0
     for i, h in enumerate(all_hits, 1):
@@ -234,32 +214,26 @@ async def chat(body: ChatRequest):
         context_blocks.append(block)
         total += len(block)
     context = "\n".join(context_blocks)
-
     if not context.strip():
         return {"reply": "No hay extractos utilizables en las fuentes internas."}
 
-    # 4) Prompts con guardarraíles
+    # Prompt
     system_prompt = (
         "Eres el asistente de JR. Trabajas EXCLUSIVAMENTE con los extractos proporcionados.\n"
-        "Reglas:\n"
-        " - Responde solo con lo que aparece en los extractos.\n"
-        " - Si la respuesta no está, di: «No consta en nuestras fuentes internas.»\n"
-        " - Cita extractos como [1], [2], ...\n"
-        " - No inventes nombres, correos ni teléfonos.\n"
-        "Objetivo: dado un tema/petición, devuelve una lista priorizada de personas y/o departamentos relevantes, "
-        "con su contacto si aparece, y una breve justificación vinculada a los extractos.\n"
+        "Responde solo con lo que aparece en los extractos; si falta, di: «No consta en nuestras fuentes internas.»\n"
+        "Cita extractos como [1], [2], ... y no inventes nombres, correos ni teléfonos.\n"
+        "Objetivo: lista priorizada de personas/departamentos relevantes con contacto si aparece, y breve justificación."
     )
     user_msg = (
         f"Extractos:\n{context}\n\n"
         f"Pregunta del usuario: {query}\n\n"
-        "Formato de salida sugerido:\n"
+        "Formato:\n"
         "1) Nombre — Puesto/Departamento (email/teléfono si aparece)\n"
         "   Motivo de relevancia: … (cita [n])\n"
         "2) …\n"
-        "Si no hay datos suficientes, responde exactamente: «No consta en nuestras fuentes internas.»"
+        "Si no hay datos, responde exactamente: «No consta en nuestras fuentes internas.»"
     )
 
-    # 5) Llamada al LLM
     try:
         completion = client.chat.completions.create(
             model=GEN_MODEL,
