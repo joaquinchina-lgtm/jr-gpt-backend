@@ -370,9 +370,43 @@ def dedup_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out.append(h)
     return out
 
+def _meta_to_text(meta: dict) -> str:
+    """
+    Devuelve un texto útil a partir de los metadatos de un hit.
+    1) Primero intenta con campos habituales (catálogos UPNA/La Rioja/UCLM/EHU).
+    2) Si no hay, concatena TODOS los valores de meta (soporta dicts/listas).
+    """
+    if not isinstance(meta, dict):
+        return str(meta or "").strip()
+
+    # 1) Campos más habituales en tus CSV
+    preferred = (
+        "group_name", "lineas_investigacion", "description", "keywords",
+        "area", "responsable", "name", "universidad", "centro",
+        "departamento", "email", "telefono"
+    )
+    parts = [str(meta.get(k, "")).strip() for k in preferred if meta.get(k)]
+    txt = " ".join(p for p in parts if p)
+    if txt:
+        return txt
+
+    # 2) Fallback: aplanar y concatenar todo
+    def _walk(x):
+        if isinstance(x, dict):
+            return " ".join(_walk(v) for v in x.values())
+        if isinstance(x, (list, tuple, set)):
+            return " ".join(_walk(v) for v in x)
+        s = str(x or "").strip()
+        return s
+
+    raw = _walk(meta).strip()
+    return raw
+
+
 # =========================
 # Endpoints utilitarios
 # =========================
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -448,14 +482,10 @@ async def chat(body: ChatRequest):
         meta = h.get("meta") or {}
         txt = (h.get("text") or "").strip()
         if not txt:
-            fields = (
-                "group_name", "lineas_investigacion", "description", "keywords",
-                "area", "responsable", "name"
-            )
-            txt = " ".join(str(meta.get(k, "")) for k in fields if meta.get(k)).strip()
+            txt = _meta_to_text(meta)  # <— NUEVO: usamos fallback robusto
 
         if not txt:
-            continue
+            continue  # si aún no hay nada, ignoramos el hit
 
         src = h.get("source", "desconocida")
         block = f"[{i}] Fuente: {src}\n{txt}\n"
@@ -468,6 +498,7 @@ async def chat(body: ChatRequest):
         return {"reply": "No constan extractos útiles en los CSV cargados."}
 
     context = "\n".join(context_blocks)
+
 
     # Prompt del asistente (texto seguro, sin comillas “raras”)
     system_prompt = (
