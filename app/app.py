@@ -399,6 +399,25 @@ class ChatRequest(BaseModel):
     mode: Optional[str] = "estricto"
     top_k: Optional[int] = 5
 
+class DebugRequest(BaseModel):
+    message: str
+    k: int = 25
+
+@app.post("/_debug/retrieve")
+def _debug_retrieve(body: DebugRequest):
+    qs = (body.message or "").strip()
+    if not qs:
+        return []
+    hits = retrieve(qs, k=body.k)
+    preview = []
+    for h in hits[: body.k]:
+        preview.append({
+            "score": float(h.get("score", 0)),
+            "source": h.get("source", ""),
+            "text": (h.get("text","")[:220] + "…") if h.get("text") else ""
+        })
+    return preview
+
 @app.post("/chat")
 async def chat(body: ChatRequest):
     try:
