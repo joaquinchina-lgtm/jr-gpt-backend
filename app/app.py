@@ -215,6 +215,28 @@ def embed(text: str) -> np.ndarray:
     v = np.array(e.data[0].embedding, dtype="float32")
     return _normalize(v)
 
+def embed_query(text: str) -> np.ndarray:
+    """
+    Devuelve el embedding de la consulta usando OpenAI y el modelo EMBED_MODEL.
+    """
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY no está configurada en el backend")
+
+    txt = (text or "").strip()
+    if not txt:
+        # vector cero si llega vacío (evita crashear)
+        dim = getattr(index, "d", 1536)  # 1536 por defecto
+        return np.zeros(dim, dtype="float32")
+
+    try:
+        # Llama a OpenAI Embeddings
+        resp = client.embeddings.create(model=EMBED_MODEL, input=[txt])
+        vec = np.array(resp.data[0].embedding, dtype="float32")
+        return vec
+    except Exception as e:
+        # Mensaje claro en caso de error de API/Modelo
+        raise HTTPException(status_code=500, detail=f"Error al generar embedding: {e}")
+
 
 @app.on_event("startup")
 def load_rag():
