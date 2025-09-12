@@ -245,43 +245,37 @@ def load_rag():
 
 def retrieve(query, k=20):
     q = embed_query(query)
-    q = np.asarray(q, dtype="float32")
-    dim = getattr(index, "d", None)
-    if dim is None:
-        raise HTTPException(status_code=500, detail="Índice FAISS no cargado correctamente")
-
-    q = _fit_to_dim(q, dim)
-    q = np.ascontiguousarray(q, dtype="float32").reshape(1, -1)
-    q = np.asarray(q, dtype="float32")
-
-# Ajuste de dimensión defensivo (si lo añadiste antes)
+# --- preparar vector consulta (float32, forma (1,d)) ---
+q = np.asarray(q, dtype="float32")
 dim = getattr(index, "d", None)
 if dim is None:
     raise HTTPException(status_code=500, detail="Índice FAISS no cargado correctamente")
-try:
-    q = _fit_to_dim(q, dim)   # <- si definiste _fit_to_dim, mantenlo; si no, puedes borrar esta línea
-except NameError:
-    pass  # si no tienes _fit_to_dim, no pasa nada
 
-# FAISS espera (1, d) y memoria contigua
+# si añadiste _fit_to_dim, úsalo; si no lo tienes, deja este try/except
+try:
+    q = _fit_to_dim(q, dim)   # opcional (parche defensivo)
+except NameError:
+    pass
+
 q = np.ascontiguousarray(q, dtype="float32").reshape(1, -1)
 
-# Búsqueda
+# --- búsqueda FAISS ---
 D, I = index.search(q, k)
 
-# Prepara lista de resultados
+# --- construir resultados ---
 out = []
-    for rank, (d, i) in enumerate(zip(D[0], I[0]), 1):
-        if i < 0:
-            continue
-        meta = metadata[i] if i < len(metadata) else {}
-        out.append({
-            "rank": rank,
-            "score": float(max(0.0, 1.0 - (d if np.isfinite(d) else 1e9))),
-            "source": meta.get("source") or meta.get("file") or "desconocida",
-            "text": meta.get("text", "")
-        })
-    return out
+for rank, (d, i) in enumerate(zip(D[0], I[0]), 1):
+    if i < 0:
+        continue
+    # ajusta este acceso a tus estructuras reales:
+    rec = store[i] if 'store' in globals() and i < len(store) else {}
+    out.append({
+        "score": float(d),
+        "text":  rec.get("text", ""),
+        "source": rec.get("source", ""),
+        "meta":  rec
+    })
+return out
 
 # =========================
 # Enriquecimiento: entidades/contacto
