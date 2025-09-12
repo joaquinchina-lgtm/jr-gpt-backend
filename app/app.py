@@ -30,7 +30,7 @@ CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "9000"))
 # =========================
 # App y middlewares
 # =========================
-app = FastAPI("JR · I+D Finder (CSV-only RAG)")
+app = FastAPI(title="JR · I+D Finder (CSV-only RAG)")
 
 app.add_middleware(
     CORSMiddleware,
