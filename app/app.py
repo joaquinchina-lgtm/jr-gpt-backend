@@ -23,6 +23,21 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 # === FastAPI (solo una vez en todo el archivo) ===
 app = FastAPI(title="JR · I+D Finder (CSV-only RAG)")
 
+@app.get("/status")
+def status():
+    dim = None
+    try:
+        dim = index.d  # dimensión del índice FAISS
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "gen_model": GEN_MODEL,
+        "embed_model": EMBED_MODEL,
+        "faiss_dim": dim,
+    }
+
+
 class ReportRequest(BaseModel):
     message: str
     mode: Optional[str] = "contextual"
