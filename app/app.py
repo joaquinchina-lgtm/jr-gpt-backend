@@ -44,6 +44,8 @@ TEXTS_PATH = os.path.join(RAG_DIR, "texts.json")
 RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.15"))
 CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "9000"))
 
+
+
 # =========================
 # App y middlewares
 # =========================
@@ -198,6 +200,17 @@ def embed(text: str) -> np.ndarray:
     v = np.array(e.data[0].embedding, dtype="float32")
     return _normalize(v)
 
+def _fit_to_dim(vec, dim: int):
+    import numpy as np
+    arr = np.asarray(vec, dtype="float32").ravel()
+    if arr.size > dim:
+        return arr[:dim]                     # recorta
+    if arr.size < dim:
+        pad = np.zeros(dim - arr.size, dtype="float32")
+        return np.concatenate([arr, pad], 0) # rellena con ceros
+    return arr
+
+
 @app.on_event("startup")
 def load_rag():
     global index, records
@@ -216,12 +229,20 @@ def load_rag():
         index = None
         records = []
 
-def retrieve(query: str, k: int = 5) -> List[Dict[str, Any]]:
-    if index is None or not records:
-        return []
-    q = embed(query)
-    D, I = index.search(np.array([q]), k)
-    out = []
+from fastapi import HTTPException
+import numpy as np
+
+def retrieve(query, k=20):
+    # ... calculas el embedding de la consulta
+    q = embed_query(query)  # vector de consulta
+
+    # Ajuste defensivo de dimensión
+    dim = getattr(index, "d", None)
+    if dim is None:
+        raise HTTPException(status_code=500, detail="Índice FAISS no cargado correctamente")
+
+    q = _fit_to_dim(q, dim)  # <-- AJUSTE
+    D, I = index.search(np.array([q], dtype="float32"), k)    out = []
     for score, idx in zip(D[0], I[0]):
         if idx == -1:
             continue
