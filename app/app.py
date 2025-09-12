@@ -3,6 +3,10 @@ import json
 import re
 from typing import List, Dict, Any, Optional
 
+GEN_MODEL  = os.getenv("GEN_MODEL", "gpt-4o-mini")           # valor seguro por defecto
+EMBED_MODEL= os.getenv("EMBED_MODEL", "text-embedding-3-small")
+
+
 import numpy as np
 import faiss
 from fastapi import FastAPI
@@ -34,7 +38,6 @@ ORIGIN = os.getenv("ORIGIN", "https://joaquinchina-lgtm.github.io")
 
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 GEN_MODEL = os.getenv("GEN_MODEL", "gpt-4o-mini")
-
 RAG_DIR = os.getenv("RAG_DIR", "rag")
 INDEX_PATH = os.path.join(RAG_DIR, "index.faiss")
 TEXTS_PATH = os.path.join(RAG_DIR, "texts.json")
@@ -257,70 +260,72 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat")
 async def chat(body: ChatRequest):
-    query = (body.message or "").strip()
-    if not query:
-        return {"reply": "Escribe una pregunta."}
+    try:
+        # 1) Entrada y defaults
+        query = (body.message or "").strip()
+        if not query:
+            return {"reply": "Escribe una pregunta."}
 
-    mode = (body.mode or "estricto").lower().strip()
-    top_k = int(body.top_k or 5)
+        mode = (body.mode or "estricto").lower().strip()
+        top_k = int(body.top_k or 5)
 
-    # Configuración por modo
-    if mode == "contextual":
-        top_k = max(top_k, 10)
-        min_score = float(os.getenv("RAG_MIN_SCORE_CTX", "0.12"))
-        temperature = 0.2
-        enable_second_hop = True
-    else:
-        min_score = RAG_MIN_SCORE
-        temperature = 0.0
-        enable_second_hop = False
+        if mode == "contextual":
+            top_k = max(top_k, 10)
+            min_score = float(os.getenv("RAG_MIN_SCORE_CTX", "0.12"))
+            temperature = 0.2
+            enable_second_hop = True
+        else:
+            min_score = RAG_MIN_SCORE
+            temperature = 0.0
+            enable_second_hop = False
 
-    # Recuperación inicial
-    hits = retrieve(query, k=top_k)
-    hits = [h for h in hits if h["score"] >= min_score]
-    if not hits:
-        return {"reply": "No consta en nuestras fuentes internas."}
+        # 2) Recuperación inicial
+        hits = retrieve(query, k=top_k)
+        hits = [h for h in hits if h.get("score", 0) >= min_score]
+        if not hits:
+            return {"reply": "No consta en nuestras fuentes internas."}
 
-    # Segundo salto opcional
-    all_hits = hits
-    if enable_second_hop:
-        names, emails, _depts = extract_entities(hits)
-        extra = []
-        extra += keyword_hits(names, limit=12)
-        extra += keyword_hits(emails, limit=12)
-        all_hits = dedup_hits(hits + extra)
+        # 3) Segundo salto opcional (defensivo)
+        all_hits = hits
+        if enable_second_hop:
+            names, emails, _depts = extract_entities(hits)
+            extra = []
+            if names:  extra += keyword_hits(names,  limit=12)
+            if emails: extra += keyword_hits(emails, limit=12)
+            all_hits = dedup_hits(hits + extra)
 
-    # Construcción de contexto
-    context_blocks: List[str] = []
-    total = 0
-    for i, h in enumerate(all_hits, 1):
-        block = f"[{i}] Fuente: {h.get('source','desconocida')}\n{h.get('text','')}\n"
-        if total + len(block) > CONTEXT_MAX_CHARS:
-            break
-        context_blocks.append(block)
-        total += len(block)
-    context = "\n".join(context_blocks)
-    if not context.strip():
-        return {"reply": "No hay extractos utilizables en las fuentes internas."}
+        # 4) Construcción de contexto (respetando límite)
+        context_blocks: List[str] = []
+        total = 0
+        for i, h in enumerate(all_hits, 1):
+            block = f"[{i}] Fuente: {h.get('source','desconocida')}\n{h.get('text','')}\n"
+            if total + len(block) > CONTEXT_MAX_CHARS:
+                break
+            context_blocks.append(block)
+            total += len(block)
+        context = "\n".join(context_blocks).strip()
+        if not context:
+            return {"reply": "No hay extractos utilizables en las fuentes internas."}
 
-    # Prompt
-    system_prompt = (
-        """Eres el asistente de JR. Trabajas EXCLUSIVAMENTE con los extractos proporcionados.
-  	Ayudas a las empresas a localizar líneas de investigación y oportunidades de I+D lo más compatibles con su actividad.
-        Responde solo con lo que aparece en los extractos; si falta, di: «No consta en nuestras fuentes internas.»
-	No sólo te limites al texto literal, devuelve sinónimos o términos relacionados con el área de investigación.
-	Devuelve todos los grupos cuya actividad pueda estar vinculada, de forma directa o indirecta, con el tema de la consulta."
-	Devuelve también todas las líneas que, de algún modo, están siendo investigadas en algunas de las universidades que figuran en los documentos fuente.
-	Incluye coincidencias literales, sinónimos y áreas próximas (ejemplo: para ‘energía fotovoltaica’, añade también grupos en energías renovables, eficiencia energética, movilidad o almacenamiento energético)."
-	Debes considerar coincidencias aunque la información esté fragmentada o dispersa en el dataset, por ejemplo si aparece únicamente en el nombre del grupo, en palabras clave sueltas, en la descripción del área o en cualquier otro campo, aunque no haya una línea de investigación explícita.
-	En caso de duda, incluye el resultado igualmente. Es preferible una lista amplia aunque algunos grupos estén en la frontera de la temática.
-        Cita extractos como [1], [2], ... y no inventes nombres, correos ni teléfonos.
-        Objetivo: lista priorizada de personas/departamentos relevantes con contacto si aparece, y breve justificación.
-	En los archivos csv revisa group_name, lineas_investigacion, area, responsable, keywords. Para EHU revisa name, description, keywords. Incluye coincidencias en cualquiera de esos campos, aunque no aparezcan en los mismos nombres de columna que en los otros catálogos.
-	Cobertura máxima de resultados
-Si hay más resultados en páginas sucesivas, continúa consultando hasta agotar la lista."""
-    )
-    user_msg = f"""Extractos:
+        # 5) Prompt
+        system_prompt = (
+            """Eres el asistente de JR. Trabajas EXCLUSIVAMENTE con los extractos proporcionados.
+Ayudas a las empresas a localizar líneas de investigación y oportunidades de I+D lo más compatibles con su actividad.
+Responde solo con lo que aparece en los extractos; si falta, di: «No consta en nuestras fuentes internas.»
+No sólo te limites al texto literal: incluye sinónimos o términos relacionados con el área de investigación.
+Devuelve todos los grupos cuya actividad pueda estar vinculada, de forma directa o indirecta, con el tema de la consulta.
+Devuelve también todas las líneas que, de algún modo, están siendo investigadas en las universidades de los documentos fuente.
+Incluye coincidencias literales, sinónimos y áreas próximas (p. ej., para ‘energía fotovoltaica’, incluye renovables, eficiencia energética, movilidad, almacenamiento).
+Considera coincidencias aunque la info esté fragmentada (nombre del grupo, palabras clave sueltas, descripción de área u otros campos).
+En caso de duda, incluye el resultado igualmente. Prefiero cobertura amplia aunque algunos grupos estén en la frontera.
+Cita extractos como [1], [2], ... y no inventes nombres, correos ni teléfonos.
+Objetivo: lista priorizada de personas/departamentos relevantes con contacto si aparece, y breve justificación.
+Para UPNA, La Rioja y UCLM revisa group_name, lineas_investigacion, area, responsable, keywords.
+Para EHU revisa name, description, keywords.
+Cobertura máxima de resultados: si hay más páginas, continúa hasta agotar la lista."""
+        )
+
+        user_msg = f"""Extractos:
 {context}
 
 Consulta de la empresa: {query}
@@ -336,8 +341,7 @@ Formato de salida:
 
 Cierra SIEMPRE con: Si deseas asistencia en explorar una colaboración, contacta en **606522663**"""
 
-
-    try:
+        # 6) Llamada a OpenAI (modelo seguro por defecto)
         completion = client.chat.completions.create(
             model=GEN_MODEL,
             messages=[
@@ -346,11 +350,13 @@ Cierra SIEMPRE con: Si deseas asistencia en explorar una colaboración, contacta
             ],
             temperature=temperature,
         )
-        reply = completion.choices[0].message.content
+        reply = completion.choices[0].message.content or "(sin respuesta)"
         return {"reply": reply}
+
     except Exception as e:
-        _log(f"Error en generación: {e}")
-        return {"reply": "No he podido generar una respuesta ahora mismo."}
+        # Error claro hacia el frontend (y activará CORS gracias al middleware)
+        _log(f"Error en /chat: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------
 # INFORME (texto simple DEMO)
