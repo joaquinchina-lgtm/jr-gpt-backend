@@ -215,15 +215,6 @@ def embed(text: str) -> np.ndarray:
     v = np.array(e.data[0].embedding, dtype="float32")
     return _normalize(v)
 
-def _fit_to_dim(vec, dim: int):
-    arr = np.asarray(vec, dtype="float32").ravel()
-    if arr.size > dim:
-        return arr[:dim]                     # recorta
-    if arr.size < dim:
-        pad = np.zeros(dim - arr.size, dtype="float32")
-        return np.concatenate([arr, pad], 0) # rellena con ceros
-    return arr
-
 
 @app.on_event("startup")
 def load_rag():
@@ -243,39 +234,69 @@ def load_rag():
         index = None
         records = []
 
-def retrieve(query, k=20):
-    q = embed_query(query)
-# --- preparar vector consulta (float32, forma (1,d)) ---
-q = np.asarray(q, dtype="float32")
-dim = getattr(index, "d", None)
-if dim is None:
-    raise HTTPException(status_code=500, detail="Índice FAISS no cargado correctamente")
+def _fit_to_dim(vec, dim: int):
+    arr = np.asarray(vec, dtype="float32").ravel()
+    if arr.size > dim:
+        return arr[:dim]                     # recorta
+    if arr.size < dim:
+        pad = np.zeros(dim - arr.size, dtype="float32")
+        return np.concatenate([arr, pad], 0) # rellena con ceros
+    return arr
 
-# si añadiste _fit_to_dim, úsalo; si no lo tienes, deja este try/except
-try:
-    q = _fit_to_dim(q, dim)   # opcional (parche defensivo)
-except NameError:
-    pass
 
-q = np.ascontiguousarray(q, dtype="float32").reshape(1, -1)
+def retrieve(query: str, k: int = 5):
+    """
+    Devuelve una lista de dicts con al menos: score, text, source, meta.
+    Requiere que exista: 
+      - una función embed_query(query) que genere el embedding de consulta
+      - un índice FAISS global 'index'
+      - (opcional) una lista/array 'store' con los metadatos por id
+    """
+    # 1) Embedding de la consulta
+    q = embed_query(query)  # <- usa tu función existente
 
-# --- búsqueda FAISS ---
-D, I = index.search(q, k)
+    # 2) Ajuste de dtype/forma
+    q = np.asarray(q, dtype="float32").ravel()
 
-# --- construir resultados ---
-out = []
-for rank, (d, i) in enumerate(zip(D[0], I[0]), 1):
-    if i < 0:
-        continue
-    # ajusta este acceso a tus estructuras reales:
-    rec = store[i] if 'store' in globals() and i < len(store) else {}
-    out.append({
-        "score": float(d),
-        "text":  rec.get("text", ""),
-        "source": rec.get("source", ""),
-        "meta":  rec
-    })
-return out
+    # 3) Ajuste de dimensión (defensivo) según el índice FAISS
+    dim = getattr(index, "d", None)
+    if dim is None:
+        raise HTTPException(status_code=500, detail="Índice FAISS no cargado correctamente")
+
+    if q.size != dim:
+        try:
+            q = _fit_to_dim(q, dim)
+        except NameError:
+            # fallback inline si no pegaste _fit_to_dim
+            if q.size > dim:
+                q = q[:dim]
+            else:
+                q = np.pad(q, (0, dim - q.size), constant_values=0).astype("float32")
+
+    q = np.ascontiguousarray(q, dtype="float32").reshape(1, -1)
+
+    # 4) Búsqueda FAISS
+    D, I = index.search(q, k)
+
+    # 5) Construir resultados
+    results = []
+    for rank, (d, i) in enumerate(zip(D[0], I[0]), 1):
+        if i < 0:
+            continue
+        # Toma metadatos si tienes una estructura global 'store' (lista de dicts)
+        rec = {}
+        if "store" in globals():
+            try:
+                rec = store[i]
+            except Exception:
+                rec = {}
+        results.append({
+            "score": float(d),
+            "text":  rec.get("text", ""),
+            "source": rec.get("source", ""),
+            "meta":  rec
+        })
+    return results
 
 # =========================
 # Enriquecimiento: entidades/contacto
