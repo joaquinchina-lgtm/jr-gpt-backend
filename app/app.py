@@ -46,13 +46,32 @@ CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "9000"))
 # =========================
 app = FastAPI(title="JR · I+D Finder (CSV-only RAG)")
 
+# --- CORS robusto (pegar justo debajo de app = FastAPI(...)) ---
+import os
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+# Lee la variable de entorno (en Render debe ser exactamente:
+# CORS_ALLOW_ORIGINS = https://joaquinchina-lgtm.github.io)
+_raw = os.getenv("CORS_ALLOW_ORIGINS", "https://joaquinchina-lgtm.github.io")
+origins = [o.strip() for o in _raw.split(",") if o.strip()]
+
+# Si alguien pone '*' en CORS_ALLOW_ORIGINS, los navegadores no permiten credenciales.
+use_wildcard = any(o == "*" for o in origins)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if ORIGIN == "*" else [ORIGIN],
-    allow_credentials=False,
-    allow_methods=["POST", "OPTIONS", "GET"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_origins=["*"] if use_wildcard else origins,
+    allow_credentials=not use_wildcard,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+# Responder a cualquier preflight OPTIONS, incluso si el handler final falla
+@app.options("/{rest_of_path:path}")
+def any_options(rest_of_path: str):
+    return JSONResponse({"ok": True})
 
 # =========================
 # OpenAI client
