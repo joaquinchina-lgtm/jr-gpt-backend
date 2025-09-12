@@ -436,8 +436,8 @@ async def chat(body: ChatRequest):
         top_k = int(body.top_k or 5)
 
         if mode == "contextual":
-            top_k = max(top_k, 10)
-            min_score = float(os.getenv("RAG_MIN_SCORE_CTX", "0.12"))
+            top_k = max(top_k, 25)
+            min_score = float(os.getenv("RAG_MIN_SCORE_CTX", "0.0"))
             temperature = 0.2
             enable_second_hop = True
         else:
@@ -447,9 +447,11 @@ async def chat(body: ChatRequest):
 
         # 2) Recuperación inicial
         hits = retrieve(query, k=top_k)
-        hits = [h for h in hits if h.get("score", 0) >= min_score]
+        # Debug opcional
+        # _log(f"/chat: retrieve devolvió {len(hits)} hits")
+
         if not hits:
-            return {"reply": "No consta en nuestras fuentes internas."}
+        return {"reply": "No se han encontrado coincidencias en los CSV cargados."}
 
         # 3) Segundo salto opcional (defensivo)
         all_hits = hits
@@ -461,17 +463,32 @@ async def chat(body: ChatRequest):
             all_hits = dedup_hits(hits + extra)
 
         # 4) Construcción de contexto (respetando límite)
-        context_blocks: List[str] = []
+        context_blocks = []
         total = 0
-        for i, h in enumerate(all_hits, 1):
-            block = f"[{i}] Fuente: {h.get('source','desconocida')}\n{h.get('text','')}\n"
+        for i, h in enumerate(hits, 1):
+            meta = h.get("meta") or {}
+            txt = (h.get("text") or "").strip()
+            if not txt:
+                # Si el chunk no trae 'text', componlo con campos del dataset
+                fields = ("group_name","lineas_investigacion","description","keywords",
+                      "area","responsable","name")
+                txt = " ".join(str(meta.get(k, "")) for k in fields if meta.get(k))
+                txt = txt.strip()
+
+            src = h.get("source", "desconocida")
+            if not txt:
+                continue  # si sigue vacío, salta
+
+            block = f"[{i}] Fuente: {src}\n{txt}\n"
             if total + len(block) > CONTEXT_MAX_CHARS:
                 break
             context_blocks.append(block)
             total += len(block)
-        context = "\n".join(context_blocks).strip()
-        if not context:
-            return {"reply": "No hay extractos utilizables en las fuentes internas."}
+
+        context = "\n".join(context_blocks)
+        if not context_blocks:
+            return {"reply": "No constan extractos útiles en los CSV cargados."}
+
 
         # 5) Prompt
         system_prompt = (
