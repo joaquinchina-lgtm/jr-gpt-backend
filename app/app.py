@@ -9,6 +9,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
+from fastapi.responses import StreamingResponse
+import io
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+
+class ReportRequest(BaseModel):
+    message: str
+    mode: str | None = "contextual"
+    top_k: int | None = 80
+
 
 # =========================
 # Configuración
@@ -44,6 +54,59 @@ app.add_middleware(
 # OpenAI client
 # =========================
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+@app.post("/report")
+async def report(body: ReportRequest):
+    """
+    Genera un informe textual sencillo (puedes sustituir 'summary' por tu lógica real).
+    """
+    summary = (
+        f"Línea de consulta: {body.message}\n"
+        f"Modo: {body.mode}\n\n"
+        "- (demo) Sustituye este bloque por tu informe real\n"
+        "Si deseas asistencia en explorar una colaboración, contacta en **606522663**"
+    )
+    return {"report": summary}
+
+
+@app.post("/report/pdf")
+async def report_pdf(body: ReportRequest):
+    """
+    Genera un PDF descargable con el informe.
+    Sustituye el contenido por tu maquetación real cuando quieras.
+    """
+    # --- aquí puedes llamar a tu generador real si lo tienes ---
+    text = (
+        f"Consulta: {body.message}\n"
+        f"Modo: {body.mode}\n\n"
+        "Informe (demo)\n"
+        "Si deseas asistencia en explorar una colaboración, contacta en 606522663"
+    )
+
+    # PDF en memoria
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+
+    y = height - 72
+    c.setFont("Helvetica-Bold", 16); c.drawString(72, y, "Informe I+D"); y -= 24
+    c.setFont("Helvetica", 11)
+    for line in text.split("\n"):
+        c.drawString(72, y, line[:110])
+        y -= 16
+        if y < 72:
+            c.showPage(); y = height - 72; c.setFont("Helvetica", 11)
+
+    c.showPage()
+    c.save()
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="informe_id.pdf"'}
+    )
+
 
 # =========================
 # Carga de índice y textos
