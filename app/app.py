@@ -2,8 +2,8 @@
 import os, json, re, io, traceback
 from typing import List, Dict, Any, Optional
 
-import numpy as np
 import faiss
+import numpy as np
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -216,7 +216,6 @@ def embed(text: str) -> np.ndarray:
     return _normalize(v)
 
 def _fit_to_dim(vec, dim: int):
-    import numpy as np
     arr = np.asarray(vec, dtype="float32").ravel()
     if arr.size > dim:
         return arr[:dim]                     # recorta
@@ -244,24 +243,44 @@ def load_rag():
         index = None
         records = []
 
-from fastapi import HTTPException
-import numpy as np
-
 def retrieve(query, k=20):
-    # ... calculas el embedding de la consulta
-    q = embed_query(query)  # vector de consulta
-
-    # Ajuste defensivo de dimensión
+    q = embed_query(query)
+    q = np.asarray(q, dtype="float32")
     dim = getattr(index, "d", None)
     if dim is None:
         raise HTTPException(status_code=500, detail="Índice FAISS no cargado correctamente")
 
-    q = _fit_to_dim(q, dim)  # <-- AJUSTE
-    D, I = index.search(np.array([q], dtype="float32"), k)    out = []
-    for score, idx in zip(D[0], I[0]):
-        if idx == -1:
+    q = _fit_to_dim(q, dim)
+    q = np.ascontiguousarray(q, dtype="float32").reshape(1, -1)
+    q = np.asarray(q, dtype="float32")
+
+# Ajuste de dimensión defensivo (si lo añadiste antes)
+dim = getattr(index, "d", None)
+if dim is None:
+    raise HTTPException(status_code=500, detail="Índice FAISS no cargado correctamente")
+try:
+    q = _fit_to_dim(q, dim)   # <- si definiste _fit_to_dim, mantenlo; si no, puedes borrar esta línea
+except NameError:
+    pass  # si no tienes _fit_to_dim, no pasa nada
+
+# FAISS espera (1, d) y memoria contigua
+q = np.ascontiguousarray(q, dtype="float32").reshape(1, -1)
+
+# Búsqueda
+D, I = index.search(q, k)
+
+# Prepara lista de resultados
+out = []
+    for rank, (d, i) in enumerate(zip(D[0], I[0]), 1):
+        if i < 0:
             continue
-        out.append({"score": float(score), **records[idx]})
+        meta = metadata[i] if i < len(metadata) else {}
+        out.append({
+            "rank": rank,
+            "score": float(max(0.0, 1.0 - (d if np.isfinite(d) else 1e9))),
+            "source": meta.get("source") or meta.get("file") or "desconocida",
+            "text": meta.get("text", "")
+        })
     return out
 
 # =========================
