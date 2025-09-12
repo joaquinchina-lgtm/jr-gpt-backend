@@ -1,32 +1,32 @@
-import os
-import json
-import re
+# === imports limpios ===
+import os, json, re, io, traceback
 from typing import List, Dict, Any, Optional
-
-GEN_MODEL  = os.getenv("GEN_MODEL", "gpt-4o-mini")           # valor seguro por defecto
-EMBED_MODEL= os.getenv("EMBED_MODEL", "text-embedding-3-small")
-
 
 import numpy as np
 import faiss
-from fastapi import FastAPI
-from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from openai import OpenAI
-from fastapi.responses import StreamingResponse
-import io
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
 from typing import Optional
-from pydantic import BaseModel
+
+
+# === configuración ===
+GEN_MODEL   = os.getenv("GEN_MODEL", "gpt-4o-mini")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+DEBUG       = os.getenv("DEBUG", "0") == "1"
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# === FastAPI (solo una vez en todo el archivo) ===
+app = FastAPI(title="JR · I+D Finder (CSV-only RAG)")
 
 class ReportRequest(BaseModel):
     message: str
     mode: Optional[str] = "contextual"
     top_k: Optional[int] = 80
-
 
 # =========================
 # Configuración
@@ -98,32 +98,78 @@ async def report(body: ReportRequest):
 @app.post("/report/pdf")
 async def report_pdf(body: ReportRequest):
     """
-    Genera un PDF descargable con el informe.
-    Sustituye el contenido por tu maquetación real cuando quieras.
+    Genera y devuelve un PDF con el informe.
+    - Lazy import de reportlab (el servicio arranca aunque la lib no esté en memoria al boot).
+    - Maquetación básica con ajuste de líneas y salto de página.
     """
-    # --- aquí puedes llamar a tu generador real si lo tienes ---
-    text = (
+    # 1) Importar reportlab SOLO aquí (lazy import)
+    try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        from reportlab.lib.units import mm
+    except Exception as e:
+        # Si faltara la lib en el build, devolvemos un error claro
+        raise HTTPException(status_code=503, detail=f"reportlab no disponible: {e}")
+
+    # 2) Texto del informe (DEMO): sustituye por tu texto real cuando quieras
+    report_text = (
         f"Consulta: {body.message}\n"
-        f"Modo: {body.mode}\n\n"
-        "Informe (demo)\n"
+        f"Modo: {body.mode}\n"
+        f"Top-K: {body.top_k}\n\n"
+        "Informe (demo). Sustituye este bloque por el informe real generado a partir de tus fuentes.\n\n"
         "Si deseas asistencia en explorar una colaboración, contacta en 606522663"
     )
 
-    # PDF en memoria
+    # 3) Crear PDF en memoria
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
 
-    y = height - 72
-    c.setFont("Helvetica-Bold", 16); c.drawString(72, y, "Informe I+D"); y -= 24
-    c.setFont("Helvetica", 11)
-    for line in text.split("\n"):
-        c.drawString(72, y, line[:110])
-        y -= 16
-        if y < 72:
-            c.showPage(); y = height - 72; c.setFont("Helvetica", 11)
+    # Márgenes y tipografías
+    left   = 20 * mm
+    right  = 20 * mm
+    top    = 20 * mm
+    bottom = 20 * mm
+    y      = height - top
 
-    c.showPage()
+    title_font_name, title_font_size = "Helvetica-Bold", 16
+    body_font_name,  body_font_size  = "Helvetica", 11
+    leading = 15  # interlineado
+    max_text_width = width - left - right
+
+    # Título
+    c.setFont(title_font_name, title_font_size)
+    c.drawString(left, y, "Informe I+D")
+    y -= (leading + 6)
+
+    # Cuerpo con ajuste de línea
+    c.setFont(body_font_name, body_font_size)
+    for paragraph in report_text.split("\n"):
+        # envolver párrafo al ancho
+        line = ""
+        words = paragraph.split(" ") if paragraph else [""]
+        lines = []
+        for w in words:
+            test = (line + " " + w).strip()
+            if stringWidth(test, body_font_name, body_font_size) <= max_text_width:
+                line = test
+            else:
+                if line:
+                    lines.append(line)
+                line = w
+        lines.append(line)
+
+        # escribir líneas; salto de página si hace falta
+        for ln in lines:
+            if y <= bottom:
+                c.showPage()
+                c.setFont(body_font_name, body_font_size)
+                y = height - top
+            c.drawString(left, y, ln)
+            y -= leading
+
+    # 4) Finalizar y devolver (sin c.showPage() extra para no añadir página en blanco)
     c.save()
     buf.seek(0)
 
@@ -261,6 +307,12 @@ class ChatRequest(BaseModel):
 @app.post("/chat")
 async def chat(body: ChatRequest):
     try:
+        # 0) Validaciones tempranas (errores claros)
+        if not os.getenv("OPENAI_API_KEY"):
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY no está configurada en el backend")
+        if not GEN_MODEL:
+            raise HTTPException(status_code=500, detail="GEN_MODEL no está configurado")
+
         # 1) Entrada y defaults
         query = (body.message or "").strip()
         if not query:
@@ -341,7 +393,7 @@ Formato de salida:
 
 Cierra SIEMPRE con: Si deseas asistencia en explorar una colaboración, contacta en **606522663**"""
 
-        # 6) Llamada a OpenAI (modelo seguro por defecto)
+        # 6) Llamada a OpenAI
         completion = client.chat.completions.create(
             model=GEN_MODEL,
             messages=[
@@ -350,13 +402,23 @@ Cierra SIEMPRE con: Si deseas asistencia en explorar una colaboración, contacta
             ],
             temperature=temperature,
         )
-        reply = completion.choices[0].message.content or "(sin respuesta)"
+        reply = (completion.choices[0].message.content or "").strip() or "(sin respuesta)"
         return {"reply": reply}
 
+    except HTTPException:
+        # Re-lanza tal cual validaciones explícitas
+        raise
     except Exception as e:
-        # Error claro hacia el frontend (y activará CORS gracias al middleware)
-        _log(f"Error en /chat: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Detalle útil para depurar
+        msg = f"{e.__class__.__name__}: {e}"
+        if DEBUG:
+            msg += " | " + "".join(traceback.format_exc(limit=3))
+        # Log (si tienes _log; si no, usa print)
+        try:
+            _log(f"Error en /chat: {msg}")
+        except NameError:
+            print(f"[JR] Error en /chat: {msg}")
+        raise HTTPException(status_code=500, detail=msg)
 
 # -------------------------
 # INFORME (texto simple DEMO)
