@@ -287,13 +287,16 @@ def health():
 
 @app.get("/status")
 def status():
+    dim = None
+    try:
+        dim = index.d  # dimensión del índice FAISS cargado
+    except Exception:
+        pass
     return {
-        "index_loaded": bool(index is not None),
-        "num_chunks": (len(records) if records else 0),
-        "origin": ORIGIN,
-        "min_score": RAG_MIN_SCORE,
-        "context_max_chars": CONTEXT_MAX_CHARS,
-        "models": {"embed": EMBED_MODEL, "gen": GEN_MODEL},
+        "ok": True,
+        "gen_model": GEN_MODEL,
+        "embed_model": EMBED_MODEL,
+        "faiss_dim": dim,
     }
 
 # =========================
