@@ -420,111 +420,82 @@ def _debug_retrieve(body: DebugRequest):
 
 @app.post("/chat")
 async def chat(body: ChatRequest):
-    try:
-        # 0) Validaciones tempranas (errores claros)
-        if not os.getenv("OPENAI_API_KEY"):
-            raise HTTPException(status_code=500, detail="OPENAI_API_KEY no está configurada en el backend")
-        if not GEN_MODEL:
-            raise HTTPException(status_code=500, detail="GEN_MODEL no está configurado")
+    query = (body.message or "").strip()
+    if not query:
+        return {"reply": "Escribe una pregunta."}
 
-        # 1) Entrada y defaults
-        query = (body.message or "").strip()
-        if not query:
-            return {"reply": "Escribe una pregunta."}
+    mode = (body.mode or "estricto").lower().strip()
+    top_k = int(body.top_k or 5)
 
-        mode = (body.mode or "estricto").lower().strip()
-        top_k = int(body.top_k or 5)
+    # Configuración por modo (dejamos min_score pero NO filtramos por score ahora)
+    if mode == "contextual":
+        top_k = max(top_k, 25)
+        min_score = float(os.getenv("RAG_MIN_SCORE_CTX", "0.0"))
+        temperature = 0.2
+    else:
+        min_score = float(os.getenv("RAG_MIN_SCORE", "0.0"))
+        temperature = 0.0
 
-        if mode == "contextual":
-            top_k = max(top_k, 25)
-            min_score = float(os.getenv("RAG_MIN_SCORE_CTX", "0.0"))
-            temperature = 0.2
-            enable_second_hop = True
-        else:
-            min_score = RAG_MIN_SCORE
-            temperature = 0.0
-            enable_second_hop = False
-
-        # 2) Recuperación inicial
-        hits = retrieve(query, k=top_k)
-        # Debug opcional
-        # _log(f"/chat: retrieve devolvió {len(hits)} hits")
-
-        if not hits:
+    # Recuperación (sin filtrar por score)
+    hits = retrieve(query, k=top_k)
+    if not hits:
         return {"reply": "No se han encontrado coincidencias en los CSV cargados."}
 
-        # 3) Segundo salto opcional (defensivo)
-        all_hits = hits
-        if enable_second_hop:
-            names, emails, _depts = extract_entities(hits)
-            extra = []
-            if names:  extra += keyword_hits(names,  limit=12)
-            if emails: extra += keyword_hits(emails, limit=12)
-            all_hits = dedup_hits(hits + extra)
+    # Construcción de contexto (si falta 'text', montamos con meta: group_name, description, etc.)
+    context_blocks = []
+    total = 0
+    for i, h in enumerate(hits, 1):
+        meta = h.get("meta") or {}
+        txt = (h.get("text") or "").strip()
+        if not txt:
+            fields = (
+                "group_name", "lineas_investigacion", "description", "keywords",
+                "area", "responsable", "name"
+            )
+            txt = " ".join(str(meta.get(k, "")) for k in fields if meta.get(k)).strip()
 
-        # 4) Construcción de contexto (respetando límite)
-        context_blocks = []
-        total = 0
-        for i, h in enumerate(hits, 1):
-            meta = h.get("meta") or {}
-            txt = (h.get("text") or "").strip()
-            if not txt:
-                # Si el chunk no trae 'text', componlo con campos del dataset
-                fields = ("group_name","lineas_investigacion","description","keywords",
-                      "area","responsable","name")
-                txt = " ".join(str(meta.get(k, "")) for k in fields if meta.get(k))
-                txt = txt.strip()
+        if not txt:
+            continue
 
-            src = h.get("source", "desconocida")
-            if not txt:
-                continue  # si sigue vacío, salta
+        src = h.get("source", "desconocida")
+        block = f"[{i}] Fuente: {src}\n{txt}\n"
+        if total + len(block) > CONTEXT_MAX_CHARS:
+            break
+        context_blocks.append(block)
+        total += len(block)
 
-            block = f"[{i}] Fuente: {src}\n{txt}\n"
-            if total + len(block) > CONTEXT_MAX_CHARS:
-                break
-            context_blocks.append(block)
-            total += len(block)
+    if not context_blocks:
+        return {"reply": "No constan extractos útiles en los CSV cargados."}
 
-        context = "\n".join(context_blocks)
-        if not context_blocks:
-            return {"reply": "No constan extractos útiles en los CSV cargados."}
+    context = "\n".join(context_blocks)
 
+    # Prompt del asistente (texto seguro, sin comillas “raras”)
+    system_prompt = (
+        "Eres el asistente de JR. Trabajas EXCLUSIVAMENTE con los extractos proporcionados. "
+        "Ayudas a las empresas a localizar líneas de investigación y oportunidades de I+D lo más "
+        "compatibles con su actividad. Responde solo con lo que aparece en los extractos; si falta, "
+        "di: «No consta en nuestras fuentes internas.» "
+        "No te limites al texto literal: incluye sinónimos y áreas próximas. Devuelve todos los grupos "
+        "cuya actividad pueda estar vinculada directa o indirectamente con el tema de la consulta. "
+        "Incluye coincidencias aunque la información esté fragmentada en nombre del grupo, keywords, "
+        "descripción o cualquier campo. En caso de duda, inclúyelo. Cita extractos como [1], [2], ..."
+    )
 
-        # 5) Prompt
-        system_prompt = (
-            """Eres el asistente de JR. Trabajas EXCLUSIVAMENTE con los extractos proporcionados.
-Ayudas a las empresas a localizar líneas de investigación y oportunidades de I+D lo más compatibles con su actividad.
-Responde solo con lo que aparece en los extractos; si falta, di: «No consta en nuestras fuentes internas.»
-No sólo te limites al texto literal: incluye sinónimos o términos relacionados con el área de investigación.
-Devuelve todos los grupos cuya actividad pueda estar vinculada, de forma directa o indirecta, con el tema de la consulta.
-Devuelve también todas las líneas que, de algún modo, están siendo investigadas en las universidades de los documentos fuente.
-Incluye coincidencias literales, sinónimos y áreas próximas (p. ej., para ‘energía fotovoltaica’, incluye renovables, eficiencia energética, movilidad, almacenamiento).
-Considera coincidencias aunque la info esté fragmentada (nombre del grupo, palabras clave sueltas, descripción de área u otros campos).
-En caso de duda, incluye el resultado igualmente. Prefiero cobertura amplia aunque algunos grupos estén en la frontera.
-Cita extractos como [1], [2], ... y no inventes nombres, correos ni teléfonos.
-Objetivo: lista priorizada de personas/departamentos relevantes con contacto si aparece, y breve justificación.
-Para UPNA, La Rioja y UCLM revisa group_name, lineas_investigacion, area, responsable, keywords.
-Para EHU revisa name, description, keywords.
-Cobertura máxima de resultados: si hay más páginas, continúa hasta agotar la lista."""
-        )
+    user_msg = (
+        f"Extractos:\n{context}\n\n"
+        f"Consulta de la empresa: {query}\n\n"
+        "Formato de salida:\n"
+        "• Línea de investigación\n"
+        "  - Descripción breve (si consta)\n"
+        "  - Grupo de investigación\n"
+        "  - Universidad/centro\n"
+        "  - Investigador/a principal (si consta)\n"
+        "  - Datos de contacto (si constan)\n"
+        "[citas: usa referencias [n] de los extractos]\n\n"
+        "Cierra SIEMPRE con: Si deseas asistencia en explorar una colaboración, contacta en **606522663**"
+    )
 
-        user_msg = f"""Extractos:
-{context}
-
-Consulta de la empresa: {query}
-
-Formato de salida:
-• Línea de investigación
-  - Descripción breve (si consta)
-  - Grupo de investigación
-  - Universidad/centro
-  - Investigador/a principal (si consta)
-  - Datos de contacto (si constan)
-[citas: usa referencias [n] de los extractos]
-
-Cierra SIEMPRE con: Si deseas asistencia en explorar una colaboración, contacta en **606522663**"""
-
-        # 6) Llamada a OpenAI
+    try:
         completion = client.chat.completions.create(
             model=GEN_MODEL,
             messages=[
@@ -533,8 +504,12 @@ Cierra SIEMPRE con: Si deseas asistencia en explorar una colaboración, contacta
             ],
             temperature=temperature,
         )
-        reply = (completion.choices[0].message.content or "").strip() or "(sin respuesta)"
+        reply = completion.choices[0].message.content
         return {"reply": reply}
+    except Exception as e:
+        _log(f"Error en generación: {e}")
+        return {"reply": "No he podido generar una respuesta ahora mismo."}
+
 
     except HTTPException:
         # Re-lanza tal cual validaciones explícitas
