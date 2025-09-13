@@ -1,17 +1,17 @@
-# Core web framework
-fastapi>=0.112,<0.117
-uvicorn[standard]>=0.30,<1.0
+# === Backend Flask definitivo (sin índice vectorial) ===
+# Sustituye COMPLETAMENTE tu requirements.txt por este contenido.
 
-# Numerical + Vector index
-numpy>=1.26,<2.0
-faiss-cpu==1.12.0   # compatible con Python 3.13
+flask==3.0.3
+flask-cors==4.0.1
 
-# OpenAI SDK (chat + embeddings)
-openai>=1.35,<2.0
+# SDK OpenAI (Responses API modernas)
+openai>=1.43.0,<2.0
 
-# Utilidades
-python-dotenv>=1.0
-pydantic>=2.7,<3.0
+# HTTP client (para Tavily u otros)
+requests>=2.32.3
 
-# PDF
-reportlab>=4.2
+# Servidor de producción en Render/Heroku/etc.
+gunicorn==22.0.0
+
+# Si usas variables en .env en local, puedes añadir:
+# python-dotenv>=1.0.1
