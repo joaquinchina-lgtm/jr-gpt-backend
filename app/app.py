@@ -237,6 +237,64 @@ def embed_query(text: str) -> np.ndarray:
         # Mensaje claro en caso de error de API/Modelo
         raise HTTPException(status_code=500, detail=f"Error al generar embedding: {e}")
 
+def _pick_meta(i: int):
+    """
+    Devuelve el registro/metadata del doc con id 'i' buscando en estructuras globales
+    con nombres habituales (store, rows, chunks, data...). Si no encuentra, {}.
+    """
+    names = ["store", "ROWS", "rows", "CHUNKS", "chunks", "DATA", "data", "docs", "DOCS"]
+    for name in names:
+        obj = globals().get(name)
+        if obj is None:
+            continue
+        # lista/tupla indexable
+        if isinstance(obj, (list, tuple)) and 0 <= i < len(obj):
+            return obj[i]
+        # dict por índice
+        if isinstance(obj, dict) and i in obj:
+            return obj[i]
+    return {}
+
+def _meta_to_text(meta: dict) -> str:
+    """
+    Devuelve un texto útil a partir de 'meta'.
+    1) Intenta con campos frecuentes de tus CSV.
+    2) Si no hay, aplana y concatena TODO (soporta dicts/listas).
+    """
+    import json
+
+    if not isinstance(meta, dict):
+        return str(meta or "").strip()
+
+    preferred = (
+        "group_name", "lineas_investigacion", "description", "keywords",
+        "area", "responsable", "name", "universidad", "centro",
+        "departamento", "email", "telefono", "title"
+    )
+    parts = [str(meta.get(k, "")).strip() for k in preferred if meta.get(k)]
+    txt = " ".join(p for p in parts if p)
+    if txt:
+        return txt
+
+    # Fallback: aplanar todo el dict/lista
+    def _walk(x):
+        if isinstance(x, dict):
+            return " ".join(_walk(v) for v in x.values())
+        if isinstance(x, (list, tuple, set)):
+            return " ".join(_walk(v) for v in x)
+        s = str(x or "").strip()
+        return s
+
+    raw = _walk(meta).strip()
+    if raw:
+        return raw
+
+    # último recurso: JSON
+    try:
+        return json.dumps(meta, ensure_ascii=False)
+    except Exception:
+        return ""
+
 
 @app.on_event("startup")
 def load_rag():
@@ -305,18 +363,25 @@ def retrieve(query: str, k: int = 5):
     for rank, (d, i) in enumerate(zip(D[0], I[0]), 1):
         if i < 0:
             continue
-        # Toma metadatos si tienes una estructura global 'store' (lista de dicts)
-        rec = {}
-        if "store" in globals():
-            try:
-                rec = store[i]
-            except Exception:
-                rec = {}
+
+        rec = _pick_meta(i)  # <— en vez de solo 'store[i]'
+        txt = ""
+        src = ""
+
+        # intenta campos típicos
+        if isinstance(rec, dict):
+            txt = (rec.get("text") or "").strip()
+            src = (rec.get("source")
+               or rec.get("universidad")
+               or rec.get("centro")
+               or rec.get("departamento")
+               or "").strip()
+
         results.append({
             "score": float(d),
-            "text":  rec.get("text", ""),
-            "source": rec.get("source", ""),
-            "meta":  rec
+            "text": txt,
+            "source": src or "desconocida",
+            "meta": rec if isinstance(rec, dict) else {"record": rec}
         })
     return results
 
@@ -443,14 +508,17 @@ def _debug_retrieve(body: DebugRequest):
     if not qs:
         return []
     hits = retrieve(qs, k=body.k)
-    preview = []
+    out = []
     for h in hits[: body.k]:
-        preview.append({
+        meta = h.get("meta") or {}
+        out.append({
             "score": float(h.get("score", 0)),
             "source": h.get("source", ""),
-            "text": (h.get("text","")[:220] + "…") if h.get("text") else ""
+            "has_text": bool(h.get("text")),
+            "meta_keys": list(meta.keys()) if isinstance(meta, dict) else [],
+            "preview": (h.get("text") or _meta_to_text(meta) or "")[:180] + "…"
         })
-    return preview
+    return out
 
 @app.post("/chat")
 async def chat(body: ChatRequest):
@@ -487,7 +555,7 @@ async def chat(body: ChatRequest):
         if not txt:
             continue  # si aún no hay nada, ignoramos el hit
 
-        src = h.get("source", "desconocida")
+        src = h.get("source", "desconocida").strip()
         block = f"[{i}] Fuente: {src}\n{txt}\n"
         if total + len(block) > CONTEXT_MAX_CHARS:
             break
@@ -495,7 +563,7 @@ async def chat(body: ChatRequest):
         total += len(block)
 
     if not context_blocks:
-        return {"reply": "No constan extractos útiles en los CSV cargados."}
+        return {"reply": "No constan infromación relevante en nuestras fuentes."}
 
     context = "\n".join(context_blocks)
 
