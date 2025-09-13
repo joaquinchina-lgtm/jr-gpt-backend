@@ -1,4 +1,4 @@
-# backend.py (Flask) — listo para Render
+# backend.py (Flask) — patched extraction for Responses API
 import os
 import logging
 import re
@@ -63,8 +63,6 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 @app.after_request
 def add_cors_headers(resp):
     origin = request.headers.get("Origin", "")
-    # Si configuraste "*" permitimos a todos los orígenes,
-    # en otro caso reflejamos el origen recibido.
     if "*" in ALLOWED_ORIGINS:
         resp.headers.setdefault("Access-Control-Allow-Origin", "*")
     else:
@@ -78,14 +76,40 @@ def add_cors_headers(resp):
 # Utilidades
 # ========
 def _extract_text(resp) -> str:
+    """
+    Extrae el texto de la respuesta del endpoint 'responses' de OpenAI de forma robusta
+    contra distintos formatos del SDK (output_text, output[].content, output[].message.content).
+    Nunca lanza excepción; si no puede extraer, devuelve string del objeto.
+    """
+    # 1) atajo del SDK
+    try:
+        txt = getattr(resp, "output_text", None)
+        if txt:
+            return str(txt).strip()
+    except Exception:
+        pass
+
     text = ""
-    out = getattr(resp, "output", None) or []
-    for item in out:
-        if getattr(item, "type", None) == "message":
-            for c in item.message.content:
+    try:
+        out = getattr(resp, "output", None) or []
+        for item in out:
+            # Puede venir como 'ResponseOutputMessage' (tiene .content) o
+            # como objeto con .message.content
+            parts = []
+            msg = getattr(item, "message", None)
+            if msg is not None and hasattr(msg, "content"):
+                parts = msg.content
+            else:
+                parts = getattr(item, "content", []) or []
+
+            for c in parts:
                 if getattr(c, "type", None) == "text":
-                    text += c.text
-    return text.strip() or "No he recibido contenido útil del modelo."
+                    text += getattr(c, "text", "")
+    except Exception as e:
+        # si fallara, devolvemos algo útil para debug
+        return f"[no parsed text] {getattr(resp, '__dict__', str(resp))[:400]}"
+
+    return text.strip() or (getattr(resp, "model_dump_json", lambda: "")() or str(resp))
 
 def tavily_search(
     query: str,
@@ -134,12 +158,10 @@ def build_retrieval_prompt(query: str, results: List[Dict[str, Any]], language: 
 # =======
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
-    # HEAD devolverá mismo status sin cuerpo
     return jsonify(status="ok"), 200
 
 @app.route("/", methods=["GET"])
 def root():
-    # Para evitar "Not Found" en el health checker si mira "/"
     return "ok", 200
 
 @app.route("/api/ask", methods=["POST", "OPTIONS"])
@@ -207,7 +229,6 @@ def retrieve():
     )
     results = tavily.get("results", [])
 
-    # Filtro por regex si procede
     if SOURCE_RE:
         results = [r for r in results if SOURCE_RE.search((r.get("url") or ""))]
 
@@ -251,13 +272,11 @@ def retrieve():
         log.exception("Error en /api/retrieve")
         return jsonify(error={"message": str(e), "tavily_note": tavily.get("note")}), 500
 
-# 404 informativo (una sola vez)
 @app.errorhandler(404)
 def notfound(e):
     return jsonify(error="route_not_found",
                    hint="usa /api/ask, /api/retrieve o /health"), 404
 
-# Alias de compatibilidad con tu endpoint antiguo
 @app.route("/_debug/retrieve", methods=["POST", "OPTIONS"])
 def old_alias():
     return retrieve()
