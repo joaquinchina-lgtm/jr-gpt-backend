@@ -261,11 +261,8 @@ def _meta_to_text(meta: dict) -> str:
     1) Intenta con campos frecuentes de tus CSV.
     2) Si no hay, aplana y concatena TODO (soporta dicts/listas).
     """
-    import json
-
     if not isinstance(meta, dict):
         return str(meta or "").strip()
-
     preferred = (
         "group_name", "lineas_investigacion", "description", "keywords",
         "area", "responsable", "name", "universidad", "centro",
@@ -278,18 +275,13 @@ def _meta_to_text(meta: dict) -> str:
 
     # Fallback: aplanar todo el dict/lista
     def _walk(x):
-        if isinstance(x, dict):
-            return " ".join(_walk(v) for v in x.values())
-        if isinstance(x, (list, tuple, set)):
-            return " ".join(_walk(v) for v in x)
+        if isinstance(x, dict): return " ".join(_walk(v) for v in x.values())
+        if isinstance(x, (list, tuple, set)): return " ".join(_walk(v) for v in x)
         s = str(x or "").strip()
-        return s
-
     raw = _walk(meta).strip()
     if raw:
         return raw
-
-    # último recurso: JSON
+    import json
     try:
         return json.dumps(meta, ensure_ascii=False)
     except Exception:
@@ -323,8 +315,9 @@ def _fit_to_dim(vec, dim: int):
         return np.concatenate([arr, pad], 0) # rellena con ceros
     return arr
 
+from typing import List, Dict, Any
 
-def retrieve(query: str, k: int = 5):
+def retrieve(query: str, k: int = 10):
     """
     Devuelve una lista de dicts con al menos: score, text, source, meta.
     Requiere que exista: 
@@ -336,54 +329,37 @@ def retrieve(query: str, k: int = 5):
     q = embed_query(query)  # <- usa tu función existente
 
     # 2) Ajuste de dtype/forma
-    q = np.asarray(q, dtype="float32").ravel()
+    q = np.asarray(q, dtype="float32")[None, :]
 
-    # 3) Ajuste de dimensión (defensivo) según el índice FAISS
-    dim = getattr(index, "d", None)
-    if dim is None:
-        raise HTTPException(status_code=500, detail="Índice FAISS no cargado correctamente")
-
-    if q.size != dim:
-        try:
-            q = _fit_to_dim(q, dim)
-        except NameError:
-            # fallback inline si no pegaste _fit_to_dim
-            if q.size > dim:
-                q = q[:dim]
-            else:
-                q = np.pad(q, (0, dim - q.size), constant_values=0).astype("float32")
-
-    q = np.ascontiguousarray(q, dtype="float32").reshape(1, -1)
-
-    # 4) Búsqueda FAISS
     D, I = index.search(q, k)
 
-    # 5) Construir resultados
-    results = []
-    for rank, (d, i) in enumerate(zip(D[0], I[0]), 1):
-        if i < 0:
+    # 3) Construir resultados
+    results: List[Dict[str, Any]] = []
+    for score, idx in zip(D[0], I[0]):
+        if idx < 0:
             continue
 
-        rec = _pick_meta(i)  # <— en vez de solo 'store[i]'
-        txt = ""
-        src = ""
+    # Metadatos robustos del registro
+    rec = _pick_meta(int(idx))  # <— AQUÍ recuperamos el meta
+    text = ""
+    source = ""
 
-        # intenta campos típicos
-        if isinstance(rec, dict):
-            txt = (rec.get("text") or "").strip()
-            src = (rec.get("source")
-               or rec.get("universidad")
-               or rec.get("centro")
-               or rec.get("departamento")
-               or "").strip()
 
-        results.append({
-            "score": float(d),
-            "text": txt,
-            "source": src or "desconocida",
-            "meta": rec if isinstance(rec, dict) else {"record": rec}
-        })
-    return results
+    if isinstance(rec, dict):
+        text = (rec.get("text") or "").strip()
+        # intenta sacar una fuente legible
+        source = (rec.get("source")
+                  or rec.get("universidad")
+                  or rec.get("centro")
+                  or rec.get("departamento")
+                  or "").strip()
+
+    results.append({
+        "score": float(score),
+        "text": text,                              # puede ir vacío
+        "source": source or "desconocida",
+        "meta": rec if isinstance(rec, dict) else {"record": rec},  # <— AQUÍ va meta
+    })
 
 # =========================
 # Enriquecimiento: entidades/contacto
@@ -546,16 +522,21 @@ async def chat(body: ChatRequest):
     # Construcción de contexto (si falta 'text', montamos con meta: group_name, description, etc.)
     context_blocks = []
     total = 0
+
+    def _fallback_preview(meta: dict) -> str:
+        import json
+        try:    return json.dumps(meta, ensure_ascii=False)[:500]
+        except: return str(meta)[:500]
+
     for i, h in enumerate(hits, 1):
         meta = h.get("meta") or {}
-        txt = (h.get("text") or "").strip()
+        txt  = (h.get("text") or "").strip()
         if not txt:
-            txt = _meta_to_text(meta)  # <— NUEVO: usamos fallback robusto
-
+            txt = _meta_to_text(meta)
         if not txt:
-            continue  # si aún no hay nada, ignoramos el hit
+            txt = _fallback_preview(meta) or "(sin extracto; ver fuente)"
 
-        src = h.get("source", "desconocida").strip()
+        src = (h.get("source") or "desconocida").strip()
         block = f"[{i}] Fuente: {src}\n{txt}\n"
         if total + len(block) > CONTEXT_MAX_CHARS:
             break
@@ -563,7 +544,7 @@ async def chat(body: ChatRequest):
         total += len(block)
 
     if not context_blocks:
-        return {"reply": "No constan infromación relevante en nuestras fuentes."}
+        return {"reply": "No consta información relevante en nuestras fuentes."}
 
     context = "\n".join(context_blocks)
 
