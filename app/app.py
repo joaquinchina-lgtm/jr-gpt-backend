@@ -1,405 +1,238 @@
-# -*- coding: utf-8 -*-
-"""
-JR · I+D Finder (CSV-only RAG)
-Backend unificado y limpio (FastAPI + FAISS + OpenAI) con:
-- /chat            -> respuesta en texto usando contexto RAG
-- /report          -> informe de texto (demo)
-- /report/pdf      -> informe PDF (demo)
-- /_debug/retrieve -> inspección de resultados RAG
-- /health, /status -> utilitarios
-"""
 import os
-import io
-import re
-import json
-import traceback
+import logging
 from typing import List, Dict, Any, Optional
 
-import numpy as np
-import faiss
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+import requests
+from flask import Flask, request, jsonify, make_response
+from flask_cors import CORS
 from openai import OpenAI
 
-# =========================
-# Configuración
-# =========================
-APP_TITLE = "JR · I+D Finder (CSV-only RAG)"
-APP_VERSION = "0.1.0"
+# ----------------- Config -----------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Modelos
-GEN_MODEL   = os.getenv("GEN_MODEL",   "gpt-4o-mini")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # opcional para búsqueda web
 
-# CORS: lista separada por comas
-CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "https://joaquinchina-lgtm.github.io")
+ALLOWED_ORIGINS = {
+    "https://joaquinchina-lgtm.github.io",  # tu GitHub Pages
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5500",
+    "http://localhost:5500",
+    "*"  # si no usas cookies, puedes dejarlo para pruebas
+}
 
-# RAG (rutas por defecto)
-RAG_DIR            = os.getenv("RAG_DIR", "rag")
-INDEX_PATH         = os.path.join(RAG_DIR, "index.faiss")
-TEXTS_PATH         = os.path.join(RAG_DIR, "texts.json")  # lista[dict] con al menos: text, source (opcional)
-
-# Otros
-RAG_MIN_SCORE      = float(os.getenv("RAG_MIN_SCORE", "0.0"))  # inicialmente sin filtro
-CONTEXT_MAX_CHARS  = int(os.getenv("CONTEXT_MAX_CHARS", "9000"))
-ALLOWED_SOURCES_RE = os.getenv("ALLOWED_SOURCES_REGEX", "")  # opcional; ejemplo: "UPNA|La Rioja|UCLM|EHU"
-DEBUG              = os.getenv("DEBUG", "0") == "1"
-
-# =========================
-# App y CORS
-# =========================
-app = FastAPI(title=APP_TITLE, version=APP_VERSION)
-
-_origins = [o.strip() for o in CORS_ALLOW_ORIGINS.split(",") if o.strip()]
-use_wildcard = any(o == "*" for o in _origins)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if use_wildcard else _origins,
-    allow_credentials=not use_wildcard,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+# ----------------- App -----------------
+app = Flask(__name__)
+CORS(
+    app,
+    resources={r"/*": {"origins": list(ALLOWED_ORIGINS)}},
+    supports_credentials=False,
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    expose_headers=["Content-Type"],
+    max_age=86400,
 )
 
-# Responder siempre a preflight
-@app.options("/{rest_of_path:path}")
-def any_options(rest_of_path: str):
-    return JSONResponse({"ok": True})
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("app")
 
-# =========================
-# OpenAI
-# =========================
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# =========================
-# Utilidades RAG
-# =========================
-index: Optional[faiss.Index] = None
-records: List[Dict[str, Any]] = []  # paralela al índice (misma longitud)
+# Añadimos cabeceras CORS por si un proxy las pierde
+@app.after_request
+def add_cors_headers(resp):
+    origin = request.headers.get("Origin", "")
+    resp.headers.setdefault("Access-Control-Allow-Origin", origin or "*")
+    resp.headers.setdefault("Vary", "Origin")
+    resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    return resp
 
-def _log(msg: str) -> None:
-    print(f"[JR/RAG] {msg}", flush=True)
+# ----------------- Utils -----------------
+def extract_text_from_openai_response(resp) -> str:
+    """Extrae texto de Responses API (compatible con 2024+)."""
+    text = ""
+    out = getattr(resp, "output", None) or []
+    for item in out:
+        if getattr(item, "type", None) == "message":
+            for c in item.message.content:
+                if getattr(c, "type", None) == "text":
+                    text += c.text
+    return text.strip() or "No he recibido contenido útil del modelo."
 
-def _normalize(v: np.ndarray) -> np.ndarray:
-    n = float(np.linalg.norm(v) or 1.0)
-    return v / n
-
-def embed_query(text: str) -> np.ndarray:
-    """Embedding de consulta con OpenAI; float32 shape (dim,)."""
-    if not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY no está configurada.")
-    t = (text or "").strip()
-    if not t:
-        # vector cero de la dim del índice para no romper FAISS
-        dim = getattr(index, "d", 1536)
-        return np.zeros(dim, dtype="float32")
-    try:
-        resp = client.embeddings.create(model=EMBED_MODEL, input=[t])
-        vec = np.asarray(resp.data[0].embedding, dtype="float32")
-        return vec
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al generar embedding: {e}")
-
-def _fit_to_dim(vec: np.ndarray, dim: int) -> np.ndarray:
-    """Ajusta recortando o rellenando con ceros para casar con index.d"""
-    arr = np.asarray(vec, dtype="float32").ravel()
-    if arr.size > dim:
-        return arr[:dim]
-    if arr.size < dim:
-        pad = np.zeros(dim - arr.size, dtype="float32")
-        return np.concatenate([arr, pad], 0)
-    return arr
-
-def _meta_to_text(meta: Any) -> str:
-    """Convierte metadatos a un texto útil para contexto."""
-    if isinstance(meta, dict):
-        preferred = (
-            "group_name","lineas_investigacion","description","keywords",
-            "area","responsable","name","universidad","centro",
-            "departamento","email","telefono","title"
-        )
-        parts = [str(meta.get(k,"")).strip() for k in preferred if meta.get(k)]
-        if parts:
-            return " ".join(parts)
-        # Fallback: aplanar todo
-        def _walk(x):
-            if isinstance(x, dict):              return " ".join(_walk(v) for v in x.values())
-            if isinstance(x, (list,tuple,set)):  return " ".join(_walk(v) for v in x)
-            return str(x or "").strip()
-        raw = _walk(meta).strip()
-        if raw:
-            return raw
-        return json.dumps(meta, ensure_ascii=False)
-    return str(meta or "").strip()
-
-def retrieve(query: str, k: int = 10) -> List[Dict[str, Any]]:
-    """Busca en FAISS y devuelve [{score,text,source,meta}]"""
-    if index is None:
-        return []
-    q = _fit_to_dim(embed_query(query), index.d)[None, :]  # (1, dim)
-    D, I = index.search(q, k)
-    out: List[Dict[str, Any]] = []
-    src_re = re.compile(ALLOWED_SOURCES_RE) if ALLOWED_SOURCES_RE else None
-    for score, idx in zip(D[0], I[0]):
-        if idx < 0:
-            continue
-        rec: Dict[str, Any] = records[idx] if 0 <= idx < len(records) else {}
-        text   = (rec.get("text") or "").strip() if isinstance(rec, dict) else ""
-        source = ""
-        if isinstance(rec, dict):
-            source = (rec.get("source")
-                      or rec.get("universidad")
-                      or rec.get("centro")
-                      or rec.get("departamento") or "").strip()
-        if src_re and source and not src_re.search(source):
-            continue
-        out.append({
-            "score": float(score),
-            "text": text,
-            "source": source or "desconocida",
-            "meta": rec if isinstance(rec, dict) else {"record": rec},
-        })
-    return out
-
-# =========================
-# Carga de índice y registros
-# =========================
-@app.on_event("startup")
-def load_rag():
-    global index, records
-    try:
-        if not (os.path.exists(INDEX_PATH) and os.path.exists(TEXTS_PATH)):
-            _log("No encuentro rag/index.faiss o rag/texts.json; el RAG seguirá vacío.")
-            index = None
-            records = []
-            return
-        index = faiss.read_index(INDEX_PATH)
-        with open(TEXTS_PATH, "r", encoding="utf-8") as f:
-            records = json.load(f)
-        _log(f"Cargado índice FAISS (dim={index.d}) y {len(records)} registros.")
-    except Exception as e:
-        index = None
-        records = []
-        _log(f"Error cargando índice/textos: {e}")
-
-# =========================
-# Schemas
-# =========================
-class ChatRequest(BaseModel):
-    message: str
-    mode: Optional[str] = "estricto"
-    top_k: Optional[int] = 5
-
-class ReportRequest(BaseModel):
-    message: str
-    mode: Optional[str] = "contextual"
-    top_k: Optional[int] = 80
-
-class DebugRequest(BaseModel):
-    message: str
-    k: int = 25
-
-# =========================
-# Endpoints utilitarios
-# =========================
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-@app.get("/status")
-def status():
-    dim = None
-    try:
-        dim = index.d  # dimensión del índice FAISS cargado
-    except Exception:
-        pass
-    return {
-        "ok": True,
-        "gen_model": GEN_MODEL,
-        "embed_model": EMBED_MODEL,
-        "faiss_dim": dim,
-        "records": len(records),
+def tavily_search(
+    query: str,
+    k: int = 6,
+    include_domains: Optional[List[str]] = None,
+    exclude_domains: Optional[List[str]] = None,
+    time_range: Optional[str] = None,  # 'd','w','m','y'
+    search_depth: str = "advanced",     # 'basic' | 'advanced'
+    include_answer: bool = True
+) -> Dict[str, Any]:
+    if not TAVILY_API_KEY:
+        return {"results": [], "answer": None, "note": "TAVILY_API_KEY not set"}
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": search_depth,
+        "max_results": int(k),
+        "include_answer": include_answer,
     }
+    if include_domains:
+        payload["include_domains"] = include_domains
+    if exclude_domains:
+        payload["exclude_domains"] = exclude_domains
+    if time_range:
+        payload["time_range"] = time_range  # 'd','w','m','y'
 
-# =========================
-# Debug
-# =========================
-@app.post("/_debug/retrieve")
-def _debug_retrieve(body: DebugRequest):
-    q = (body.message or "").strip()
-    if not q:
-        return []
-    hits = retrieve(q, k=body.k)
-    out = []
-    for h in hits[: body.k]:
-        meta = h.get("meta") or {}
-        out.append({
-            "score": float(h.get("score", 0)),
-            "source": h.get("source", ""),
-            "has_text": bool(h.get("text")),
-            "meta_keys": list(meta.keys()) if isinstance(meta, dict) else [],
-            "preview": (h.get("text") or _meta_to_text(meta) or "")[:180] + "…"
-        })
-    return out
+    r = requests.post("https://api.tavily.com/search", json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()
 
-# =========================
-# /chat
-# =========================
-@app.post("/chat")
-def chat(body: ChatRequest):
-    query = (body.message or "").strip()
-    if not query:
-        return {"reply": "Escribe una pregunta."}
+def build_retrieval_prompt(query: str, results: List[Dict[str, Any]], language: str = "es") -> str:
+    """
+    Construye un prompt con evidencias y pide respuesta con citas [1], [2]...
+    """
+    lines = []
+    lines.append(f"Idioma de respuesta: {language}")
+    lines.append("Responde conciso y con rigor. Usa SOLO las evidencias listadas y cita como [n].")
+    lines.append("")
+    lines.append("EVIDENCIAS:")
+    for i, it in enumerate(results, 1):
+        title = it.get("title") or it.get("url")
+        url = it.get("url", "")
+        content = (it.get("content") or "")[:1200]  # recorte para no pasar de token
+        lines.append(f"### [{i}] {title}\n{url}\n{content}\n")
+    lines.append("")
+    lines.append(f"PREGUNTA DEL USUARIO: {query}")
+    lines.append("Instrucciones de respuesta:")
+    lines.append("- Resumen claro en 1-2 párrafos.")
+    lines.append("- Lista de hallazgos clave si procede.")
+    lines.append("- Cierra con 'Fuentes: [1], [2]...' solo con los índices usados.")
+    return "\n".join(lines)
 
-    # estrategia por modo
-    mode = (body.mode or "estricto").lower().strip()
-    top_k = int(body.top_k or 5)
-    if mode == "contextual":
-        top_k = max(top_k, 25)
-        temperature = 0.2
-    else:
-        temperature = 0.0
+# ----------------- Rutas -----------------
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify(status="ok")
 
-    # Recuperación
-    hits = retrieve(query, k=top_k)
-    if not hits:
-        return {"reply": "No se han encontrado coincidencias en los CSV cargados."}
+# Compatibilidad con tu fetch anterior
+@app.route("/_debug/retrieve", methods=["POST", "OPTIONS"])
+def old_alias():
+    return retrieve()
 
-    # Construcción de contexto robusto
-    context_blocks: List[str] = []
-    total = 0
-    for i, h in enumerate(hits, 1):
-        meta = h.get("meta") or {}
-        txt  = (h.get("text") or "").strip() or _meta_to_text(meta) or "(sin extracto)"
-        src  = (h.get("source") or "desconocida").strip()
-        block = f"[{i}] Fuente: {src}\n{txt}\n"
-        if total + len(block) > CONTEXT_MAX_CHARS:
-            break
-        context_blocks.append(block)
-        total += len(block)
+@app.route("/api/ask", methods=["POST", "OPTIONS"])
+def ask():
+    if request.method == "OPTIONS":
+        return make_response(("", 204))
 
-    if not context_blocks:
-        return {"reply": "No consta información relevante en nuestras fuentes."}
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    temperature = float(data.get("temperature", 0.3))
+    top_p = float(data.get("top_p", 1.0))
+    system = data.get("system") or "Eres un asistente útil y conciso."
 
-    context = "\n".join(context_blocks)
+    if not message:
+        return jsonify(error={"message": "Missing 'message'"}), 400
 
-    system_prompt = (
-        "Eres el asistente de JR. Trabajas EXCLUSIVAMENTE con los extractos proporcionados. "
-        "Ayudas a las empresas a localizar líneas de investigación y oportunidades de I+D compatibles. "
-        "Responde solo con lo que aparece en los extractos; si falta, di: «No consta en nuestras fuentes internas.» "
-        "Incluye sinónimos y áreas próximas; en caso de duda, inclúyelo. Cita extractos como [1], [2], ..."
-    )
-
-    user_msg = (
-        f"Extractos:\n{context}\n\n"
-        f"Consulta de la empresa: {query}\n\n"
-        "Formato de salida:\n"
-        "• Línea de investigación\n"
-        "  - Descripción breve (si consta)\n"
-        "  - Grupo de investigación\n"
-        "  - Universidad/centro\n"
-        "  - Investigador/a principal (si consta)\n"
-        "  - Datos de contacto (si constan)\n"
-        "[citas: usa referencias [n] de los extractos]\n\n"
-        "Cierra SIEMPRE con: Si deseas asistencia en explorar una colaboración, contacta en **606522663**"
-    )
+    if client is None:
+        log.warning("OPENAI_API_KEY no configurada. Devolviendo eco.")
+        return jsonify(reply=f"[ECO backend sin OpenAI] {message}"), 200
 
     try:
-        completion = client.chat.completions.create(
-            model=GEN_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg},
-            ],
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
             temperature=temperature,
+            top_p=top_p,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": message},
+            ],
         )
-        reply = completion.choices[0].message.content
-        return {"reply": reply}
+        text = extract_text_from_openai_response(resp)
+        return jsonify(reply=text), 200
     except Exception as e:
-        msg = f"{e.__class__.__name__}: {e}"
-        if DEBUG:
-            msg += " | " + "".join(traceback.format_exc(limit=2))
-        _log(f"Error en /chat -> {msg}")
-        return {"reply": "No he podido generar una respuesta ahora mismo."}
+        log.exception("Error en /api/ask")
+        return jsonify(error={"message": str(e)}), 500
 
-# =========================
-# /report (demo texto) y /report/pdf (demo PDF)
-# =========================
-@app.post("/report")
-def report(body: ReportRequest):
-    summary = (
-        f"Línea de consulta: {body.message}\n"
-        f"Modo: {body.mode}\n\n"
-        "- (demo) Sustituye este bloque por tu informe real\n"
-        "Si deseas asistencia en explorar una colaboración, contacta en **606522663**"
+@app.route("/api/retrieve", methods=["POST", "OPTIONS"])
+def retrieve():
+    if request.method == "OPTIONS":
+        return make_response(("", 204))
+
+    body = request.get_json(silent=True) or {}
+    # Parámetros de búsqueda avanzados
+    query = (body.get("query") or body.get("message") or "").strip()
+    if not query:
+        return jsonify(error={"message": "Missing 'query'"}), 400
+
+    k = int(body.get("k", 6))
+    include_domains = body.get("include_domains") or body.get("domains") or None
+    exclude_domains = body.get("exclude_domains") or None
+    time_range = body.get("time_range") or None   # 'd','w','m','y'
+    search_depth = body.get("search_depth", "advanced")  # 'basic'|'advanced'
+    language = body.get("language", "es")
+    temperature = float(body.get("temperature", 0.2))
+    top_p = float(body.get("top_p", 1.0))
+    system = body.get("system") or "Eres un analista que sintetiza evidencias y cita fuentes."
+
+    # 1) Buscar (si hay TAVILY_API_KEY). Si no, devolvemos sin web con aviso.
+    tavily = tavily_search(
+        query=query,
+        k=k,
+        include_domains=include_domains,
+        exclude_domains=exclude_domains,
+        time_range=time_range,
+        search_depth=search_depth,
+        include_answer=True,
     )
-    return {"report": summary}
+    results = tavily.get("results", [])
+    # 2) Construir prompt con evidencias
+    prompt = build_retrieval_prompt(query, results, language=language)
 
-@app.post("/report/pdf")
-def report_pdf(body: ReportRequest):
+    if client is None:
+        # Sin OpenAI devolvemos resultados crudos para que al menos veas evidencia
+        return jsonify(
+            reply="[ECO backend sin OpenAI] Devuelvo evidencias tal cual.",
+            citations=[{"title": r.get("title"), "url": r.get("url")} for r in results],
+            raw=tavily,
+        ), 200
+
     try:
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.pagesizes import A4
-        from reportlab.pdfbase.pdfmetrics import stringWidth
-        from reportlab.lib.units import mm
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            temperature=temperature,
+            top_p=top_p,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        text = extract_text_from_openai_response(resp)
+
+        # Citas: devolvemos título+url para que el frontend pinte enlaces
+        citations = [{"title": r.get("title"), "url": r.get("url")} for r in results[:k]]
+
+        return jsonify(
+            reply=text,
+            citations=citations,
+            query=query,
+            params={
+                "k": k,
+                "include_domains": include_domains,
+                "exclude_domains": exclude_domains,
+                "time_range": time_range,
+                "search_depth": search_depth,
+                "temperature": temperature,
+                "top_p": top_p,
+                "language": language,
+            },
+        ), 200
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"reportlab no disponible: {e}")
+        log.exception("Error en /api/retrieve")
+        return jsonify(error={"message": str(e), "tavily_note": tavily.get("note")}), 500
 
-    report_text = (
-        f"Consulta: {body.message}\n"
-        f"Modo: {body.mode}\n"
-        f"Top-K: {body.top_k}\n\n"
-        "Informe (demo). Sustituye este bloque por el informe real generado a partir de tus fuentes.\n\n"
-        "Si deseas asistencia en explorar una colaboración, contacta en 606522663"
-    )
-
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    width, height = A4
-
-    left   = 20 * mm; right = 20 * mm; top = 20 * mm; bottom = 20 * mm
-    y      = height - top
-
-    title_font_name, title_font_size = "Helvetica-Bold", 16
-    body_font_name,  body_font_size  = "Helvetica", 11
-    leading = 15
-    max_text_width = width - left - right
-
-    c.setFont(title_font_name, title_font_size)
-    c.drawString(left, y, "Informe I+D")
-    y -= (leading + 6)
-
-    c.setFont(body_font_name, body_font_size)
-    for paragraph in report_text.split("\n"):
-        line = ""
-        words = paragraph.split(" ") if paragraph else [""]
-        lines = []
-        for w in words:
-            test = (line + " " + w).strip()
-            if stringWidth(test, body_font_name, body_font_size) <= max_text_width:
-                line = test
-            else:
-                if line:
-                    lines.append(line)
-                line = w
-        lines.append(line)
-        for ln in lines:
-            if y <= bottom:
-                c.showPage()
-                c.setFont(body_font_name, body_font_size)
-                y = height - top
-            c.drawString(left, y, ln)
-            y -= leading
-
-    c.save()
-    buf.seek(0)
-
-    return StreamingResponse(
-        buf,
-        media_type="application/pdf",
-        headers={"Content-Disposition": 'attachment; filename="informe_id.pdf"'}
-    )
-
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
