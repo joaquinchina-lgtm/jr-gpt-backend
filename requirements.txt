@@ -1,6 +1,6 @@
-# requirements.txt
-flask==3.0.3
-flask-cors==4.0.1
-openai>=1.43.0,<2.0
-requests>=2.32.3
-gunicorn==22.0.0
+flask>=3.0,<4
+flask-cors>=4.0,<5
+openai>=1.40.0
+requests>=2.31.0
+beautifulsoup4>=4.12.2
+gunicorn>=22.0.0
