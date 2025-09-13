@@ -126,7 +126,7 @@ def build_retrieval_prompt(query: str, results: List[Dict[str, Any]], language: 
 # =======
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify(status="ok")
+    return jsonify(status="ok"), 200
 
 @app.route("/api/ask", methods=["POST", "OPTIONS"])
 def ask():
@@ -236,10 +236,6 @@ def retrieve():
     except Exception as e:
         log.exception("Error en /api/retrieve")
         return jsonify(error={"message": str(e), "tavily_note": tavily.get("note")}), 500
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify(status="ok"), 200
 
 @app.route("/", methods=["GET"])
 def root():
