@@ -1,6 +1,6 @@
-# backend.py — RAG SOLO desde CSV en ./knowledge (sin Tavily)
+# backend.py — RAG SOLO desde CSV en ./knowledge (sin Tavily) — FIXED QUOTES
 import os, re, csv, logging, unicodedata
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from difflib import SequenceMatcher
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
@@ -164,7 +164,7 @@ def top_k(query: str, k: int, neighbors: int = 1) -> List[Dict[str, Any]]:
         if d["id"] in seen:
             continue
         results.append(d); seen.add(d["id"])
-        # añade vecinos +-1 fila del mismo fichero para algo de contexto local
+        # añade vecinos +-1 fila del mismo fichero para contexto
         if neighbors:
             for dd in KNOWLEDGE:
                 if dd["file"] == d["file"] and abs(dd["row"] - d["row"]) <= neighbors and dd["id"] not in seen:
@@ -182,10 +182,10 @@ def build_prompt(query: str, frags: List[Dict[str, Any]], language: str = "es") 
     lines.append("\nEVIDENCIAS:")
     for i, d in enumerate(frags, 1):
         content = d['text'][:CONTEXT_MAX_CHARS]
-        lines.append(f\"\"\"### [{i}] {d['file']} (fila {d['row']})
+        lines.append(f"""### [{i}] {d['file']} (fila {d['row']})
 {content}
-\"\"\".strip())
-    lines.append(f\"\nPREGUNTA: {query}\")
+""".strip())
+    lines.append(f"\nPREGUNTA: {query}")
     lines.append("- Estructura: resumen breve y, si procede, lista de puntos clave.")
     lines.append("- No inventes. Sólo usa lo que está en las evidencias.")
     return "\n".join(lines)
@@ -250,7 +250,6 @@ def rag():
 
     frags = top_k(query, k=k, neighbors=1)
     if not frags:
-        # Sin evidencias relevantes => respuesta estándar
         return jsonify(reply="No aparece en las fuentes.", citations=[], query=query), 200
 
     prompt = build_prompt(query, frags, language=language)
