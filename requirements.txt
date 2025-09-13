@@ -1,17 +1,6 @@
-# === Backend Flask definitivo (sin índice vectorial) ===
-# Sustituye COMPLETAMENTE tu requirements.txt por este contenido.
-
+# requirements.txt
 flask==3.0.3
 flask-cors==4.0.1
-
-# SDK OpenAI (Responses API modernas)
 openai>=1.43.0,<2.0
-
-# HTTP client (para Tavily u otros)
 requests>=2.32.3
-
-# Servidor de producción en Render/Heroku/etc.
 gunicorn==22.0.0
-
-# Si usas variables en .env en local, puedes añadir:
-# python-dotenv>=1.0.1
