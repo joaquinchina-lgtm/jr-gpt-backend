@@ -237,6 +237,22 @@ def retrieve():
         log.exception("Error en /api/retrieve")
         return jsonify(error={"message": str(e), "tavily_note": tavily.get("note")}), 500
 
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify(status="ok"), 200
+
+@app.route("/", methods=["GET"])
+def root():
+    # Para que Render no marque "Not found" aunque mire "/"
+    return "ok", 200
+
+# (opcional, pero útil)
+@app.errorhandler(404)
+def notfound(e):
+    return jsonify(error="route_not_found",
+                   hint="usa /api/ask, /api/retrieve o /health"), 404
+
+
 # Alias de compatibilidad con tu endpoint antiguo
 @app.route("/_debug/retrieve", methods=["POST", "OPTIONS"])
 def old_alias():
