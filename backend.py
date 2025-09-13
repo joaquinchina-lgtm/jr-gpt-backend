@@ -1,4 +1,4 @@
-# backend.py
+# backend.py (Flask) — listo para Render
 import os
 import logging
 import re
@@ -41,9 +41,12 @@ DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
 # Inicializar
 # ============
 app = Flask(__name__)
+
+# CORS (si hay "*" en la lista, usa wildcard global)
+cors_origins = "*" if "*" in ALLOWED_ORIGINS else list(ALLOWED_ORIGINS)
 CORS(
     app,
-    resources={r"/*": {"origins": list(ALLOWED_ORIGINS)}},
+    resources={r"/*": {"origins": cors_origins}},
     supports_credentials=False,
     methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
@@ -60,7 +63,12 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 @app.after_request
 def add_cors_headers(resp):
     origin = request.headers.get("Origin", "")
-    resp.headers.setdefault("Access-Control-Allow-Origin", origin or "*")
+    # Si configuraste "*" permitimos a todos los orígenes,
+    # en otro caso reflejamos el origen recibido.
+    if "*" in ALLOWED_ORIGINS:
+        resp.headers.setdefault("Access-Control-Allow-Origin", "*")
+    else:
+        resp.headers.setdefault("Access-Control-Allow-Origin", origin or "")
     resp.headers.setdefault("Vary", "Origin")
     resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
     resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -124,9 +132,15 @@ def build_retrieval_prompt(query: str, results: List[Dict[str, Any]], language: 
 # =======
 # Rutas
 # =======
-@app.route("/health", methods=["GET"])
+@app.route("/health", methods=["GET", "HEAD"])
 def health():
+    # HEAD devolverá mismo status sin cuerpo
     return jsonify(status="ok"), 200
+
+@app.route("/", methods=["GET"])
+def root():
+    # Para evitar "Not Found" en el health checker si mira "/"
+    return "ok", 200
 
 @app.route("/api/ask", methods=["POST", "OPTIONS"])
 def ask():
@@ -237,17 +251,11 @@ def retrieve():
         log.exception("Error en /api/retrieve")
         return jsonify(error={"message": str(e), "tavily_note": tavily.get("note")}), 500
 
-@app.route("/", methods=["GET"])
-def root():
-    # Para que Render no marque "Not found" aunque mire "/"
-    return "ok", 200
-
-# (opcional, pero útil)
+# 404 informativo (una sola vez)
 @app.errorhandler(404)
 def notfound(e):
     return jsonify(error="route_not_found",
                    hint="usa /api/ask, /api/retrieve o /health"), 404
-
 
 # Alias de compatibilidad con tu endpoint antiguo
 @app.route("/_debug/retrieve", methods=["POST", "OPTIONS"])
